@@ -19,7 +19,9 @@
  */
 import { wrapLanguageModel } from 'ai';
 import { rateLimitMiddleware } from './rateLimiter';
+import { providerDebugMiddleware } from './providerLog';
 import {
+  AUTO_MODEL,
   CapabilityScores,
   ModelInfo,
   modelById,
@@ -198,6 +200,24 @@ export function isModelEnabled(info: ModelInfo): boolean {
 }
 
 /**
+ * The effective context-window size (in tokens) for a model id, used to warn
+ * when a run's context is filling up: the user's `myDevTeam.modelContextWindows`
+ * override wins (so a local model's real `num_ctx` can be set), then the model's
+ * built-in `contextWindow`. Undefined when neither is known, so the caller emits
+ * no context warnings rather than guessing.
+ */
+export function contextWindowFor(id: string | undefined): number | undefined {
+  if (id === undefined) {
+    return undefined;
+  }
+  const override = runtimeConfig().modelContextWindows[id];
+  if (typeof override === 'number' && override > 0) {
+    return override;
+  }
+  return modelById(id)?.contextWindow;
+}
+
+/**
  * Resolve a user's model pin against the disable layers, so a hard-blocked pin
  * never runs. A pin naming a disabled model, or a `provider:<name>` pin naming a
  * disabled provider, is dropped (returns undefined), so the run falls back to
@@ -227,7 +247,7 @@ export function effectivePin(pin?: string): string | undefined {
  * minus anything disabled at either layer. The triage pool; the work agents use
  * the `workModels()` subset. */
 export function availableModels(): ModelInfo[] {
-  return modelRegistry.filter((m) => isModelAvailable(m) && isModelEnabled(m));
+  return modelRegistry().filter((m) => isModelAvailable(m) && isModelEnabled(m));
 }
 
 /**
@@ -244,19 +264,33 @@ export function workModels(): ModelInfo[] {
 /** The local Ollama models, minus anything disabled at either layer. The
  * default candidate pool for triage (the "ollama" provider choice). */
 export function localModels(): ModelInfo[] {
-  return modelRegistry.filter((m) => m.provider === 'ollama' && isModelEnabled(m));
+  return modelRegistry().filter((m) => m.provider === 'ollama' && isModelEnabled(m));
 }
 
 /** The provider names the registry knows, in a stable order. */
 const providerNames: readonly ProviderName[] = providerIds;
 
 /**
+ * What triage routes by when the user set no `myDevTeam.triage.model`: the work
+ * model (`myDevTeam.model`) when it names a concrete model or provider, so a
+ * user who picks a cloud provider for the work agents gets triage on it too
+ * rather than the local default failing for want of an Ollama server; otherwise
+ * (the work model is "auto") the build's `backend.json` `agents.triage.model`
+ * floor - the cheap local classifier the default deployment ships.
+ */
+function triageDefault(): string {
+  const work = runtimeConfig().workModel;
+  return work && work !== AUTO_MODEL ? work : backendConfig.agents.triage.model;
+}
+
+/**
  * How the triage agent is routed. The user's `myDevTeam.triage.model` wins when
- * set; otherwise the build's `backend.json` `agents.triage.model` floor (the
- * "ollama" provider by default). This mirrors how the work agents' model is
- * chosen - user-controlled, with the backend providing only the default and the
- * unbypassable disable layers (applied via the candidate pools and `routeModel`,
- * so triage can never reach a provider/model the operator disabled).
+ * set; otherwise the work model cascades in (see `triageDefault`: the user's
+ * `myDevTeam.model` when concrete, else the `backend.json` `agents.triage.model`
+ * floor). This mirrors how the work agents' model is chosen - user-controlled,
+ * with the backend providing only the default and the unbypassable disable
+ * layers (applied via the candidate pools and `routeModel`, so triage can never
+ * reach a provider/model the operator disabled).
  *
  * The chosen value is interpreted leniently: "auto" routes among all available
  * models; a registered model id pins that exact model; a provider - written as
@@ -268,7 +302,7 @@ const providerNames: readonly ProviderName[] = providerIds;
  * rules as every other agent.
  */
 export function triageRouting(): { pin?: string; candidates: readonly ModelInfo[] } {
-  const choice = runtimeConfig().triageModel || backendConfig.agents.triage.model;
+  const choice = runtimeConfig().triageModel || triageDefault();
   if (choice === 'auto') {
     return { candidates: availableModels() };
   }
@@ -281,7 +315,7 @@ export function triageRouting(): { pin?: string; candidates: readonly ModelInfo[
       ? (choice as ProviderName)
       : undefined;
   if (provider) {
-    const pool = modelRegistry.filter((m) => m.provider === provider && isModelEnabled(m));
+    const pool = modelRegistry().filter((m) => m.provider === provider && isModelEnabled(m));
     if (pool.length > 0) {
       return { candidates: pool };
     }
@@ -354,13 +388,18 @@ export function resolveModel(
   const key = instanceKey(info);
   let model = instances.get(key);
   if (!model) {
-    // Wrap every wired model in the rate limiter: it throttles to the
-    // configured RPM and retries a provider 429 after the suggested delay. The
-    // middleware reads its settings live, so the wrapped instance can be
-    // memoised even though the limit can change between requests.
+    // Wrap every wired model in two middlewares (both read their gate live, so
+    // the wrapped instance can be memoised even though the behaviour can change
+    // between requests): the debug logger (outermost - it traces one logical
+    // request/response pair to the debug sink when `myDevTeam.debug` is on, and is
+    // a pass-through otherwise), and below it the rate limiter, which throttles to
+    // the configured RPM and retries a provider 429 after the suggested delay.
     model = wrapLanguageModel({
       model: factory(info.model),
-      middleware: rateLimitMiddleware(info.provider),
+      middleware: [
+        providerDebugMiddleware(info.provider, info.model),
+        rateLimitMiddleware(info.provider),
+      ],
     }) as RoutedModel;
     instances.set(key, model);
   }

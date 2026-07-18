@@ -1,5 +1,4 @@
 import * as vscode from 'vscode';
-import { registerTools } from './tools/registerTools';
 import { WorkspaceToolHost } from './tools/toolHost';
 import { McpHub } from './client/mcp';
 import { createEngineProvider } from './client/engineFactory';
@@ -7,8 +6,11 @@ import { EvalLog } from './client/evalLog';
 import { ChangeTracker } from './client/changeTracker';
 import {
   PARTICIPANT_ID,
+  COMPACT_NOW_COMMAND_ID,
   ChatApprover,
   ChatPlanReviewer,
+  ChatContinuePrompt,
+  ChatClarifyPrompt,
   createHandler,
   TurnMetadata,
 } from './ui/chatParticipant';
@@ -22,6 +24,7 @@ import {
   SET_API_KEY_COMMAND_ID,
 } from './ui/modelCommands';
 import { pickVerbosity, SELECT_VERBOSITY_COMMAND_ID } from './ui/verbosityCommands';
+import { pickTriageMode, SELECT_TRIAGE_MODE_COMMAND_ID } from './ui/triageModeCommands';
 import { StatusBar, STATUS_MENU_COMMAND_ID } from './ui/statusBar';
 import { runShowUsageCommand, SHOW_USAGE_COMMAND_ID } from './ui/usageView';
 import { registerEditorEntryPoints } from './ui/editorEntryPoints';
@@ -29,7 +32,9 @@ import { registerQuickQuestion } from './ui/quickQuestion';
 import { setRuntimeConfig } from './config/runtimeConfig';
 import { liveRuntimeConfig } from './config/settings';
 import { setSecretSource } from './config/credentials';
+import { setDebugSink } from './config/debugLog';
 import { loadStoredApiKeys, secretStorageSource } from './client/secrets';
+import { DebugChannel, DEBUG_CHANNEL_NAME } from './client/debugLog';
 
 export function activate(context: vscode.ExtensionContext) {
   // --- Engine runtime config ---
@@ -44,6 +49,17 @@ export function activate(context: vscode.ExtensionContext) {
   // The sidecar child never loads this module, so it keeps the env-only default.
   setSecretSource(secretStorageSource);
   void loadStoredApiKeys(context.secrets);
+
+  // --- Debug logging seam: the "My Dev Team (Debug)" output channel ---
+  // When `myDevTeam.debug` is on, every run is traced here: the client logs the
+  // client<->backend protocol (via the engine tracer below), and the engine logs
+  // each provider-API call. The in-process local engine writes through this
+  // injected sink directly; the sidecar forwards its entries over the wire (the
+  // engine provider wires that side). A no-op when the setting is off.
+  const debugOutput = vscode.window.createOutputChannel(DEBUG_CHANNEL_NAME);
+  context.subscriptions.push(debugOutput);
+  const debugChannel = new DebugChannel(debugOutput);
+  setDebugSink(debugChannel.asSink());
 
   // --- Approval seam: Phase 1 uses the chat-based approver ---
   // Created before the tool host because the side-effecting `run` tool is
@@ -66,6 +82,20 @@ export function activate(context: vscode.ExtensionContext) {
   const planReviewer = new ChatPlanReviewer(planPreview);
   planReviewer.register(context);
 
+  // --- Executor check-in seam: the "still working, keep going?" prompt ---
+  // Registered up front like the plan reviewer so its in-chat Keep going / Stop
+  // links work; the engine calls it via the run client's confirmContinue when a
+  // long task crosses the myDevTeam.executor.checkpoint* thresholds.
+  const continuePrompt = new ChatContinuePrompt();
+  continuePrompt.register(context);
+
+  // --- Planner clarification: the "a quick question before I plan?" prompt ---
+  // The planner's `clarify` tool dispatches to this through the run host's `tool`
+  // capability; the answer is collected in a pop-up and the client composes it
+  // into the tool result that rides back into the planner loop. No command
+  // registration - the pop-up is modal.
+  const clarifyPrompt = new ChatClarifyPrompt();
+
   // --- Run-transparency seam: mirror executed commands into a terminal ---
   // Every approved `run` command's live output lands in a read-only
   // "Dev Team" terminal tab the user can open; never revealed automatically.
@@ -86,13 +116,14 @@ export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push({ dispose: () => void mcp.dispose() });
 
   // --- The client's hands: the workspace ToolHost ---
-  // The one place tool calls are validated and dispatched, shared by the
-  // engine's executor loop and the editor-wide Language Model Tools
-  // registrations. Whichever engine runs, the implementations, the approval
-  // gate, the mirror, and the change tracker stay here on the user's machine.
-  // The MCP hub is handed in so a discovered MCP tool dispatches like any other.
+  // The one place tool calls are validated and dispatched - the client half of
+  // the engine's tool inversion (the `tool` capability of the run's ClientHost).
+  // Whichever engine runs, the implementations, the approval gate, the mirror,
+  // and the change tracker stay here on the user's machine. The MCP hub is
+  // handed in so a discovered MCP tool dispatches like any other. The tools are
+  // deliberately not registered as editor-wide Language Model Tools: they are
+  // private to `@devteam`, not exposed for other chat models in the editor to call.
   const toolHost = new WorkspaceToolHost(approver, runMirror, changeTracker, mcp);
-  registerTools(context, toolHost);
 
   // --- The engine, behind the protocol ---
   // The provider reads `myDevTeam.engine` live per request: the in-process
@@ -105,7 +136,7 @@ export function activate(context: vscode.ExtensionContext) {
     'dist',
     'sidecar.js'
   ).fsPath;
-  const engineProvider = createEngineProvider(sidecarScriptPath);
+  const engineProvider = createEngineProvider(sidecarScriptPath, debugChannel);
   const getEngine = engineProvider.getEngine;
   context.subscriptions.push({ dispose: () => engineProvider.dispose() });
   void checkEngineAtStartup(getEngine());
@@ -140,9 +171,17 @@ export function activate(context: vscode.ExtensionContext) {
     // so the picker is just a setting write (no status-bar refresh needed - the
     // menu reads the mode fresh when it opens).
     vscode.commands.registerCommand(SELECT_VERBOSITY_COMMAND_ID, () => pickVerbosity()),
+    // Routing mode: the engine reads myDevTeam.triage.mode live, so the picker is
+    // just a setting write (the menu reads the mode fresh when it opens).
+    vscode.commands.registerCommand(SELECT_TRIAGE_MODE_COMMAND_ID, () => pickTriageMode()),
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (e.affectsConfiguration('myDevTeam.model')) {
         void statusBar.refresh();
+      }
+      // The hover shows a "Debug mode: on" line while myDevTeam.debug is on;
+      // redraw it the moment the setting flips so the line is never stale.
+      if (e.affectsConfiguration('myDevTeam.debug')) {
+        statusBar.redrawTooltip();
       }
     })
   );
@@ -180,6 +219,18 @@ export function activate(context: vscode.ExtensionContext) {
   // references, and approvals all flow through the same pipeline.
   registerEditorEntryPoints(context);
 
+  // The "Compact now" action a context warning offers (below the auto-compact
+  // threshold): opens the chat with `@devteam /compact`, reusing the manual
+  // compact path. Registered programmatically (invoked from a trusted chat link,
+  // not the command palette), like the approval/review link commands.
+  context.subscriptions.push(
+    vscode.commands.registerCommand(COMPACT_NOW_COMMAND_ID, () =>
+      vscode.commands.executeCommand('workbench.action.chat.open', {
+        query: '@devteam /compact',
+      })
+    )
+  );
+
   // --- UI layer: the chat participant ---
   const handler = createHandler(
     getEngine,
@@ -196,7 +247,13 @@ export function activate(context: vscode.ExtensionContext) {
     // The same MCP hub the ToolHost uses: the handler discovers its tools and
     // ships them on the run request, so the offered names and shipped
     // definitions are one set.
-    mcp
+    mcp,
+    // The check-in seam: the handler offers confirmContinue so a long run can
+    // pause and ask whether to keep going.
+    continuePrompt,
+    // The clarify prompt: the handler offers the `clarify` tool (and dispatches
+    // its calls here) so the planner can ask a focused question while drafting.
+    clarifyPrompt
   );
   const participant = vscode.chat.createChatParticipant(
     PARTICIPANT_ID,
@@ -207,17 +264,51 @@ export function activate(context: vscode.ExtensionContext) {
       // turn's pending review and stream are untouched. (The approval session
       // is opened inside the handler, keyed by the run id.)
       const reviewSession = planReviewer.openSession(stream);
+      const checkpointSession = continuePrompt.openSession(stream);
+      const clarifySession = clarifyPrompt.openSession(stream);
       const cancellation = token.onCancellationRequested(() => {
         reviewSession.dispose();
+        checkpointSession.dispose();
+        clarifySession.dispose();
       });
       try {
         return await handler(request, ctx, stream, token);
       } finally {
         cancellation.dispose();
         reviewSession.dispose(); // idempotent: a cancelled request already closed it
+        checkpointSession.dispose();
+        clarifySession.dispose();
       }
     }
   );
+
+  // Clarify follow-ups: when a turn ended by asking (intent "clarify"), offer
+  // each suggested answer as a clickable chip. Clicking one submits it as the
+  // next turn to this participant, so the engine sees the question and the answer
+  // in the conversation history and carries the work forward - the same path a
+  // typed reply takes (the chips are a shortcut, not the only way to answer).
+  participant.followupProvider = {
+    provideFollowups(result) {
+      const questions = (result.metadata as Partial<TurnMetadata> | undefined)?.questions;
+      if (!questions || questions.length === 0) {
+        return [];
+      }
+      const followups: vscode.ChatFollowup[] = [];
+      const labelMany = questions.length > 1;
+      for (const q of questions) {
+        for (const option of q.options) {
+          followups.push({
+            prompt: option,
+            // With several questions a bare option is ambiguous, so prefix the
+            // chip with a short slice of its question; a single question needs no
+            // prefix.
+            label: labelMany ? `${q.question.slice(0, 24)}: ${option}` : option,
+          });
+        }
+      }
+      return followups;
+    },
+  };
 
   // Built-in feedback: 👍/👎 from the native chat panel arrive here. The
   // handler put the run id and route into the judged turn's result metadata,

@@ -88,6 +88,24 @@ describe('McpHub', () => {
     expect(connector.opened).toEqual([]);
   });
 
+  it('discovers tools when trust is granted after an untrusted call (B-3)', async () => {
+    // First call happens before trust is granted: it must not memoise the empty
+    // result, or granting trust mid-session would never surface the tools.
+    __setTrusted(false);
+    setServers({ fs: { command: 'fs-cmd' } });
+    const connector = fakeConnector({ fs: fakeConnection([{ name: 'read' }]) });
+    const hub = new McpHub(connector);
+
+    expect(await hub.listToolDefs()).toEqual([]);
+    expect(connector.opened).toEqual([]);
+
+    // The user grants workspace trust; the next call discovers for real.
+    __setTrusted(true);
+    const defs = await hub.listToolDefs();
+    expect(defs.map((d) => d.name)).toEqual(['mcp__fs__read']);
+    expect(connector.opened).toEqual(['fs']);
+  });
+
   it('offers nothing when no servers are configured', async () => {
     const connector = fakeConnector({});
     const hub = new McpHub(connector);

@@ -24,12 +24,15 @@ const mdGlob = {
 };
 
 await build({
-  // Two bundles: the extension host entry, and the engine sidecar child entry
-  // (a plain Node process - it never imports `vscode`). The `{ in, out }` form
-  // names them dist/extension.js and dist/sidecar.js.
+  // Three bundles: the extension host entry, and two engine sidecar child
+  // entries (plain Node processes - they never import `vscode`): the IPC one
+  // this extension forks, and the stdio (NDJSON) one a non-Node client (the
+  // IntelliJ plugin) spawns. The `{ in, out }` form names them
+  // dist/extension.js, dist/sidecar.js, and dist/sidecar-stdio.js.
   entryPoints: [
     { in: 'src/extension.ts', out: 'extension' },
     { in: 'src/sidecar/main.ts', out: 'sidecar' },
+    { in: 'src/sidecar/stdioMain.ts', out: 'sidecar-stdio' },
   ],
   bundle: true,
   outdir: 'dist',

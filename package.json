@@ -2,9 +2,9 @@
   "name": "my-dev-team",
   "displayName": "My Dev Team",
   "description": "An agentic chat participant for VS Code with tool-calling (read, search, run, write) and built-in feedback.",
-  "version": "0.53.0",
+  "version": "0.80.0",
   "icon": "media/my-dev-team.png",
-  "publisher": "bobro",
+  "publisher": "mydevteam-ai",
   "private": true,
   "license": "Apache-2.0",
   "repository": {
@@ -23,6 +23,9 @@
     "onStartupFinished"
   ],
   "main": "./dist/extension.js",
+  "extensionKind": [
+    "workspace"
+  ],
   "capabilities": {
     "untrustedWorkspaces": {
       "supported": "limited",
@@ -61,6 +64,19 @@
           "type": "string",
           "default": "",
           "description": "What @devteam uses for the quick internal triage step (deciding whether a request is a question or work). Leave empty to use the build's default (a local Ollama model unless the build changed it). Set it from the /model command's \"Triage only\" group, or here: \"provider:llamacpp\" routes to a local llama.cpp server, \"provider:openai\" (or anthropic/groq) routes within that cloud provider, \"auto\" picks the best available model, or a model id pins one. A provider or model the build disabled cannot be selected here."
+        },
+        "myDevTeam.triage.mode": {
+          "type": "string",
+          "enum": [
+            "classifier",
+            "combined"
+          ],
+          "enumDescriptions": [
+            "Run the quick triage step first, then the answerer or the planner - the default three-agent path.",
+            "Run one combined agent that decides the route and produces the answer or the plan in a single call - one fewer round-trip, and a request can never be misrouted into a dead-end answer. Uses your work model (myDevTeam.model), not the triage model."
+          ],
+          "default": "classifier",
+          "description": "How @devteam routes a request. Classifier (the default) runs the cheap triage step, then the answerer or planner. Combined runs a single responder that triages and answers-or-plans in one call on your work model. Only the normal path is affected: a slash command (/fix, /plan, ...) still pins the route and uses the dedicated agents."
         },
         "myDevTeam.complexityRouting": {
           "type": "boolean",
@@ -110,6 +126,11 @@
           ],
           "description": "How much @devteam shows in the chat. Verbose (the default) shows the agents' full reasoning; Default is a terser view. A pure display choice - it changes nothing the agents do. Switch it with the /verbose command or the My Dev Team status-bar menu."
         },
+        "myDevTeam.attachActiveEditor": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically attach the file you have open as context on every @devteam request - or just the selected text when you have a selection - so 'analyse the current file' or 'explain this selection' works without attaching anything yourself. On by default. Turn it off to attach nothing automatically (for example to keep a small local model's context window clear, or for privacy); you can still attach files explicitly with the paperclip or #file."
+        },
         "myDevTeam.disabledProviders": {
           "type": "array",
           "items": {
@@ -125,6 +146,65 @@
           },
           "default": [],
           "description": "Individual model ids @devteam must never use (e.g. [\"qwen3-coder\"]). The router skips them and the /model picker shows them as disabled; a disabled model never runs even when pinned (the run falls back to Auto). On top of any models the build itself disables, which you cannot re-enable here."
+        },
+        "myDevTeam.customModels": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "id",
+              "label",
+              "provider",
+              "model"
+            ],
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "Unique id for this model (must not match a built-in model's id - custom models can only add, not redefine)."
+              },
+              "label": {
+                "type": "string",
+                "description": "Display name shown in the /model picker and the \"which model ran\" line."
+              },
+              "provider": {
+                "type": "string",
+                "enum": [
+                  "ollama",
+                  "llamacpp",
+                  "openai",
+                  "anthropic",
+                  "groq",
+                  "deepseek",
+                  "zai",
+                  "google"
+                ],
+                "description": "Which already-wired provider hosts the model. New custom models reuse an existing provider's wiring and API key; you cannot add a new provider here."
+              },
+              "model": {
+                "type": "string",
+                "description": "The provider-specific model name, e.g. the Anthropic API id (claude-...) or the Ollama tag."
+              },
+              "tier": {
+                "type": "string",
+                "enum": [
+                  "simple",
+                  "moderate",
+                  "complex"
+                ],
+                "description": "The model's weight class for complexity routing. Defaults to \"moderate\"."
+              },
+              "capabilities": {
+                "type": "object",
+                "description": "Optional 0-1 capability scores (reasoning, coding, classification, planning, speed, structured-output) used when Auto routes. Optional: a pinned model ignores scores, so you only need these if you want Auto to consider this model."
+              },
+              "description": {
+                "type": "string",
+                "description": "Optional one-line note on what the model is good for, shown in the /model picker."
+              }
+            }
+          },
+          "default": [],
+          "description": "Extra models to make available without updating the extension, e.g. a newly released Anthropic model. Each entry needs an id, a label, a provider (one already wired: anthropic, openai, google, ollama, llamacpp, groq, deepseek, zai), and the provider's model name. Cloud models still need that provider's API key. Pin one from the /model picker, or give capability scores to let Auto route to it. Add-only: an entry whose id matches a built-in model is ignored."
         },
         "myDevTeam.ollama.endpoint": {
           "type": "string",
@@ -151,6 +231,21 @@
           "default": "",
           "description": "Optional custom base URL for the Groq provider (a proxy or gateway). Leave empty to use Groq's default endpoint. The API key is read from the GROQ_API_KEY environment variable (or, for the local engine, the \"Set API Key\" command), not here."
         },
+        "myDevTeam.deepseek.baseUrl": {
+          "type": "string",
+          "default": "",
+          "description": "Optional custom base URL for the DeepSeek provider (a proxy or gateway). Leave empty to use DeepSeek's default endpoint. The API key is read from the DEEPSEEK_API_KEY environment variable (or, for the local engine, the \"Set API Key\" command), not here."
+        },
+        "myDevTeam.zai.baseUrl": {
+          "type": "string",
+          "default": "",
+          "description": "Optional custom base URL for the Z.AI provider (the GLM models, a proxy or gateway). Leave empty to use Z.AI's default endpoint (https://api.z.ai/api/paas/v4). The API key is read from the ZAI_API_KEY environment variable (or, for the local engine, the \"Set API Key\" command), not here."
+        },
+        "myDevTeam.google.baseUrl": {
+          "type": "string",
+          "default": "",
+          "description": "Optional custom base URL for the Google (Gemini) provider (a proxy or gateway). Leave empty to use Google's default Generative Language API endpoint. The API key is read from the GOOGLE_GENERATIVE_AI_API_KEY environment variable (or, for the local engine, the \"Set API Key\" command), not here."
+        },
         "myDevTeam.provider.requestsPerMinute": {
           "type": [
             "number",
@@ -165,6 +260,22 @@
           "default": 60000,
           "minimum": 1,
           "description": "Timeout in milliseconds for shell commands started by the run tool. The whole process tree is killed when it expires."
+        },
+        "myDevTeam.run.allowedCommands": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Commands the run tool may execute without an approval prompt, matched as a token-boundary prefix or a glob (e.g. \"git status\", \"npm test\", \"npm run *\"). Only a single, non-chained command matches; a command that chains, pipes, or redirects, or that matches the denylist, always prompts. The Always allow commands like this approval choice appends to this list."
+        },
+        "myDevTeam.run.deniedCommands": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Extra command patterns (same prefix/glob form as run.allowedCommands) that always prompt and are treated as destructive, on top of a non-removable built-in list covering both POSIX commands (rm, git push, git reset, curl, wget, and similar) and the PowerShell equivalents on Windows (Remove-Item, Stop-Process, Invoke-Expression, Format-Volume, and similar). A denylisted command is never auto-approved by an allowlist entry or an existing Allow All grant, regardless of how the agent flagged it."
         },
         "myDevTeam.read.maxLines": {
           "type": "number",
@@ -195,6 +306,53 @@
           "default": 5,
           "minimum": 0,
           "description": "Number of leading lines of a written file's contents shown as a snippet under the write call in the execution transcript. 0 hides the snippet."
+        },
+        "myDevTeam.executor.checkpointEverySteps": {
+          "type": "number",
+          "default": 100,
+          "minimum": 0,
+          "description": "During a long task, @devteam pauses after this many tool-calling steps and asks whether to keep going or stop and summarize what it has so far. 0 turns the step-based check-in off. Whichever of this and myDevTeam.executor.checkpointEverySeconds is reached first triggers the check-in."
+        },
+        "myDevTeam.executor.checkpointEverySeconds": {
+          "type": "number",
+          "default": 600,
+          "minimum": 0,
+          "description": "During a long task, @devteam pauses after this many seconds and asks whether to keep going or stop and summarize what it has so far. 0 turns the time-based check-in off. Whichever of this and myDevTeam.executor.checkpointEverySteps is reached first triggers the check-in."
+        },
+        "myDevTeam.executor.contextWarnThresholds": {
+          "type": "array",
+          "items": {
+            "type": "number",
+            "minimum": 1,
+            "maximum": 100
+          },
+          "default": [
+            75,
+            85,
+            95
+          ],
+          "description": "Context-usage levels (as a percentage of the model's context window) at which @devteam shows a notice during a long run, so you can tell when it is close to filling the model's window. Each level below myDevTeam.history.autoCompactThreshold also offers a \"Compact now\" action; at or above the threshold the conversation auto-compacts instead (when myDevTeam.history.autoCompact is on). Each level warns once. An empty list falls back to the default."
+        },
+        "myDevTeam.history.autoCompact": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically compact the conversation when its context nears the model's window. Once a run crosses myDevTeam.history.autoCompactThreshold, your next message first summarizes the conversation so far and continues against that summary, so a long session cannot silently overflow the window. Turn off to only ever compact when you click the \"Compact now\" action the warnings offer (or run /compact)."
+        },
+        "myDevTeam.history.autoCompactThreshold": {
+          "type": "number",
+          "minimum": 1,
+          "maximum": 100,
+          "default": 95,
+          "description": "Context-usage level (as a percentage of the model's context window) at or above which the conversation auto-compacts on your next message (when myDevTeam.history.autoCompact is on). Below it, a context warning only offers a manual \"Compact now\" action. Set it to one of myDevTeam.executor.contextWarnThresholds for the trigger to line up with a warning."
+        },
+        "myDevTeam.modelContextWindows": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "number",
+            "minimum": 1
+          },
+          "default": {},
+          "description": "Per-model context-window sizes in tokens, keyed by model id (e.g. {\"qwen3-coder\": 32768}). Overrides the built-in value, which matters most for local models: their real window is whatever the server was started with (num_ctx), not the model's theoretical maximum. Used only to calculate the context-usage warnings."
         },
         "myDevTeam.instructions.files": {
           "type": "array",
@@ -282,7 +440,17 @@
         "myDevTeam.thinking.showInChat": {
           "type": "boolean",
           "default": true,
-          "description": "Show a reasoning model's thinking live as a transient progress line while @devteam works, condensed to its latest line. The thinking is never kept past the run; turning this off skips capturing reasoning entirely."
+          "description": "Capture a reasoning model's thinking while it works. The live \"is reasoning\" indicator is VS Code's own built-in progress (the rotating \"Thinking\"/\"Generating\"/… verbs), shown either way; this only controls capturing the reasoning so its duration can be timed. Turning it off skips capturing entirely (and removes the \"Thought for Ns\" line)."
+        },
+        "myDevTeam.thinking.showDuration": {
+          "type": "boolean",
+          "default": true,
+          "description": "After a reasoning model finishes, append a \"Thought for Ns\" line under the reply showing how long it spent thinking. Requires myDevTeam.thinking.showInChat (the time is measured from the thinking it surfaces)."
+        },
+        "myDevTeam.clarify.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Let @devteam ask you a clarifying question instead of guessing when a request is genuinely ambiguous. The run ends with one or more questions (each with suggested answers you can click, or you can type your own); your reply on the next turn carries the work forward. Turn this off to make @devteam always pick a sensible assumption and proceed without asking."
         },
         "myDevTeam.telemetry.evalLog": {
           "type": "boolean",
@@ -293,6 +461,11 @@
           "type": "boolean",
           "default": false,
           "description": "On a slash-command run (which pins the route), also run triage in the background to record what it would have decided, so the Show Token Usage report can score triage against the command you chose. Adds one local triage call per pinned run and only collects data while the eval log is on. Off by default."
+        },
+        "myDevTeam.debug": {
+          "type": "boolean",
+          "default": false,
+          "description": "Log all communication between the chat client, the engine backend (the in-process or sidecar engine), and the AI provider's API - including the raw request and response messages - to the \"My Dev Team (Debug)\" output channel. Off by default. Turn it on only to diagnose a problem: the log is verbose and the raw messages contain your prompts, file contents, and the model's replies. Everything stays on your machine."
         }
       }
     },
@@ -316,6 +489,11 @@
       {
         "command": "myDevTeam.selectVerbosity",
         "title": "Select Output Mode",
+        "category": "My Dev Team"
+      },
+      {
+        "command": "myDevTeam.selectTriageMode",
+        "title": "Select Routing Mode",
         "category": "My Dev Team"
       },
       {
@@ -399,142 +577,6 @@
           }
         ]
       }
-    ],
-    "languageModelTools": [
-      {
-        "name": "devteam__read",
-        "displayName": "Read File",
-        "modelDescription": "Read the text of a workspace file given its relative path, up to a configured number of lines per call. Optional startLine/endLine select a 1-based inclusive range; a partial result names the range shown, the file's total lines, and the startLine to continue with.",
-        "tags": [
-          "myDevTeam"
-        ],
-        "inputSchema": {
-          "type": "object",
-          "properties": {
-            "path": {
-              "type": "string",
-              "description": "Workspace-relative path of the file to read."
-            },
-            "startLine": {
-              "type": "integer",
-              "minimum": 1,
-              "description": "First line to read (1-based, inclusive). Defaults to 1."
-            },
-            "endLine": {
-              "type": "integer",
-              "minimum": 1,
-              "description": "Last line to read (1-based, inclusive). Defaults to the per-call line cap counted from startLine; clamped to it when larger."
-            }
-          },
-          "required": [
-            "path"
-          ]
-        }
-      },
-      {
-        "name": "devteam__search",
-        "displayName": "Search Files",
-        "modelDescription": "Search the workspace for files matching a glob, or for text contained within files.",
-        "tags": [
-          "myDevTeam"
-        ],
-        "inputSchema": {
-          "type": "object",
-          "properties": {
-            "query": {
-              "type": "string",
-              "description": "Glob pattern (e.g. **/*.ts) or text to search for."
-            },
-            "mode": {
-              "type": "string",
-              "enum": [
-                "glob",
-                "content"
-              ],
-              "description": "Whether to match file names by glob or search file contents for text."
-            }
-          },
-          "required": [
-            "query",
-            "mode"
-          ]
-        }
-      },
-      {
-        "name": "devteam__run",
-        "displayName": "Run Command",
-        "modelDescription": "Run a shell command in the workspace root. This is a side-effecting action and requires user confirmation.",
-        "tags": [
-          "myDevTeam"
-        ],
-        "inputSchema": {
-          "type": "object",
-          "properties": {
-            "command": {
-              "type": "string",
-              "description": "The shell command to execute."
-            }
-          },
-          "required": [
-            "command"
-          ]
-        }
-      },
-      {
-        "name": "devteam__write",
-        "displayName": "Write File",
-        "modelDescription": "Create or overwrite a file in the workspace with the given contents. This is a side-effecting action and requires user confirmation.",
-        "tags": [
-          "myDevTeam"
-        ],
-        "inputSchema": {
-          "type": "object",
-          "properties": {
-            "path": {
-              "type": "string",
-              "description": "Workspace-relative path of the file to create or update."
-            },
-            "contents": {
-              "type": "string",
-              "description": "The full new contents of the file."
-            }
-          },
-          "required": [
-            "path",
-            "contents"
-          ]
-        }
-      },
-      {
-        "name": "devteam__edit",
-        "displayName": "Edit File",
-        "modelDescription": "Replace text in an existing workspace file. The exact old text must match one place in the file. This is a side-effecting action and requires user confirmation.",
-        "tags": [
-          "myDevTeam"
-        ],
-        "inputSchema": {
-          "type": "object",
-          "properties": {
-            "path": {
-              "type": "string",
-              "description": "Workspace-relative path of the existing file to edit."
-            },
-            "oldText": {
-              "type": "string",
-              "description": "The exact text to replace, copied verbatim from the file. Must match exactly one place; include surrounding lines to make it unique."
-            },
-            "newText": {
-              "type": "string",
-              "description": "The text that replaces oldText."
-            }
-          },
-          "required": [
-            "path",
-            "oldText",
-            "newText"
-          ]
-        }
-      }
     ]
   },
   "scripts": {
@@ -557,6 +599,8 @@
   },
   "dependencies": {
     "@ai-sdk/anthropic": "^3.0.84",
+    "@ai-sdk/deepseek": "^2.0.38",
+    "@ai-sdk/google": "^3.0.83",
     "@ai-sdk/groq": "^3.0.41",
     "@ai-sdk/openai": "^3.0.71",
     "@mastra/core": "^1.41.0",

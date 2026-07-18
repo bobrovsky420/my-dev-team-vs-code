@@ -2,9 +2,11 @@
  * The sidecar wire: the messages that cross between the client (parent) and the
  * engine host (child). This module imports no `vscode` and no Node-only APIs, so
  * both ends and the unit tests can use it. The shapes mirror the engine protocol
- * - run events, the `tool-call` and `plan-review` inversions, and the run result
- * - so the child is just the `LocalEngine` with its `RunClient` piped to the
- * parent (see sidecar/childRuntime.ts and client/sidecarEngine.ts).
+ * - the run-event stream, the single `invoke`/`invoke-result` inversion (every
+ * engine->client request - a tool, a plan review, a check-in, a clarify, a skill
+ * body - crosses it, named by capability), and the run result - so the child is
+ * just the `LocalEngine` with its `RunClient` piped to the parent (see
+ * sidecar/childRuntime.ts and client/sidecarEngine.ts).
  *
  * The Node client transports these as `child_process.fork` IPC messages
  * (`serialization: 'advanced'`, a real structured clone, no framing); they are
@@ -13,9 +15,11 @@
  * stream without changing the contract - which `createStreamChannel`
  * (client/sidecarEngine.ts) does, over any writable/readable pair.
  */
-import { RunRequest, Reply, Plan, PlanDecision, Complexity } from '../protocol/types';
+import { RunRequest, Reply } from '../protocol/types';
 import { RunEvent, RunStep } from '../protocol/events';
+import { CapabilityName } from '../protocol/capabilities';
 import { RuntimeConfig } from '../config/runtimeConfig';
+import { DebugEntry } from '../config/debugLog';
 
 /**
  * How a settled run is reported back, preserving the protocol's error shape so
@@ -32,16 +36,21 @@ export type RunResult =
 export type ParentMessage =
   /** Inject/refresh the engine's runtime config (handshake, then on settings change). */
   | { t: 'config'; config: RuntimeConfig }
-  /** Start a run. `canReviewPlan` mirrors whether the real client offers the
-   * plan-approval seam, so the child only gates when the parent can answer. */
-  | { t: 'start'; runId: string; request: RunRequest; canReviewPlan: boolean }
+  /** Start a run. `capabilities` mirrors the real client's `ClientHost.capabilities`,
+   * so the child's proxy host advertises exactly what the parent can answer and
+   * the engine degrades an unsupported one. */
+  | {
+      t: 'start';
+      runId: string;
+      request: RunRequest;
+      capabilities: CapabilityName[];
+    }
   /** Cancel a run. */
   | { t: 'cancel'; runId: string }
-  /** Answer a `tool-call`: the tool's returned text, or the error it threw. */
-  | { t: 'tool-result'; callId: string; ok: true; result: string }
-  | { t: 'tool-result'; callId: string; ok: false; error: string }
-  /** Answer a `plan-review` with the user's verdict, keyed by the review's id. */
-  | { t: 'plan-decision'; reviewId: string; decision: PlanDecision }
+  /** Answer an `invoke`: the capability's result, or the error it threw. Keyed by
+   * the call's id so a run with several in-flight invokes never confuses them. */
+  | { t: 'invoke-result'; callId: string; ok: true; result: unknown }
+  | { t: 'invoke-result'; callId: string; ok: false; error: string }
   /** Ask the engine a one-shot question (the picker catalogue, startup warnings). */
   | { t: 'query'; queryId: string; method: 'listModels' | 'startupWarnings' };
 
@@ -57,15 +66,28 @@ export type ChildMessage =
   | { t: 'ready'; protocolVersion: number; kind: string }
   /** A run event (the engine's `onEvent`), forwarded verbatim for rendering. */
   | { t: 'event'; runId: string; event: RunEvent }
-  /** The engine asks the client to execute a tool and answer with a `tool-result`. */
-  | { t: 'tool-call'; runId: string; callId: string; tool: string; args: unknown }
   /**
-   * The engine asks the client to approve a plan and answer with a
-   * `plan-decision`. `runId` finds the run's client; `reviewId` correlates the
-   * resolver, so a run that issues more than one review never overwrites a
-   * pending one (the way `callId` correlates a `tool-call`).
+   * The engine asks the client to run one capability (a tool, a plan review, a
+   * check-in, a clarify, a skill body) and answer with an `invoke-result`.
+   * `runId` finds the run's client; `callId` correlates the resolver, so a run
+   * that issues several invokes at once never overwrites a pending one. The one
+   * inversion message - what was the `tool-call`/`plan-review`/`continue-review`
+   * trio plus the never-built clarify/skill bridges, now a single envelope.
    */
-  | { t: 'plan-review'; runId: string; reviewId: string; plan: Plan; complexity: Complexity }
+  | {
+      t: 'invoke';
+      runId: string;
+      callId: string;
+      capability: CapabilityName;
+      payload: unknown;
+    }
+  /**
+   * A debug-log entry from the child's engine (its provider-API traffic), posted
+   * only when `myDevTeam.debug` is on. The parent writes it to the same "My Dev
+   * Team (Debug)" output channel as its own client<->backend trace. Run-agnostic:
+   * a debug entry is not tied to a single run's lifecycle.
+   */
+  | { t: 'debug'; entry: DebugEntry }
   /** The run settled (its `result` promise resolved or rejected). */
   | { t: 'result'; runId: string; result: RunResult }
   /** A query answer. */

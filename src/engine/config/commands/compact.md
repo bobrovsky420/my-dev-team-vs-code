@@ -4,8 +4,7 @@ description: Summarize the conversation so far; the summary then stands in for i
 intent: oneshot
 ---
 
-The user invoked the /compact command: write a compact briefing of the
-conversation so far that can replace it in future turns. Cover what was
-asked, what was decided, which files were created or changed, and what is
-still open. Reply with only the summary; do not add commentary about the
-command itself.
+The user invoked /compact. The engine handles this command on its own path (it
+runs the dedicated compacter agent over the conversation - see
+config/agents/compacter.md), so this preamble is not used to drive the summary.
+It is kept only so the command is registered for autocomplete and route-pinning.

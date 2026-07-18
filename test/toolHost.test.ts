@@ -34,13 +34,13 @@ function makeMcp(
 
 /** Approver test double recording calls and returning a fixed verdict. */
 function makeApprover(verdict: boolean): Approver & {
-  calls: Array<{ title: string; detail: string }>;
+  calls: Array<{ title: string; detail: string; scope: string }>;
 } {
-  const calls: Array<{ title: string; detail: string }> = [];
+  const calls: Array<{ title: string; detail: string; scope: string }> = [];
   return {
     calls,
-    confirm: async (title: string, detail: string) => {
-      calls.push({ title, detail });
+    confirm: async (title: string, detail: string, scope: string) => {
+      calls.push({ title, detail, scope });
       return verdict;
     },
   };
@@ -117,7 +117,25 @@ describe('WorkspaceToolHost', () => {
     const host = new WorkspaceToolHost(approver);
 
     await expect(host.execute('run', { command: 'echo hi' })).resolves.toBe('hi');
-    expect(approver.calls[0]).toEqual({ title: 'Run command', detail: '$ echo hi' });
+    expect(approver.calls[0]).toEqual({
+      title: 'Run command',
+      detail: '$ echo hi',
+      scope: 'run',
+    });
+  });
+
+  it('forwards the dangerous flag, escalating the run approval', async () => {
+    execMock.mockImplementation((_cmd, _opts, cb) =>
+      cb(null, { stdout: 'done', stderr: '' })
+    );
+    const approver = makeApprover(true);
+    const host = new WorkspaceToolHost(approver);
+
+    await expect(
+      host.execute('run', { command: 'git reset --hard', dangerous: true })
+    ).resolves.toBe('done');
+    expect(approver.calls[0].title).toBe('⚠️ Run destructive command');
+    expect(approver.calls[0].scope).toBe('run:dangerous');
   });
 
   it('forwards the run correlation id to the approval prompt (B-2)', async () => {
@@ -125,8 +143,10 @@ describe('WorkspaceToolHost', () => {
       cb(null, { stdout: 'hi', stderr: '' })
     );
     const seen: Array<string | undefined> = [];
+    const scopes: string[] = [];
     const approver: Approver = {
-      confirm: async (_title, _detail, correlationId) => {
+      confirm: async (_title, _detail, scope, correlationId) => {
+        scopes.push(scope);
         seen.push(correlationId);
         return true;
       },
@@ -139,6 +159,8 @@ describe('WorkspaceToolHost', () => {
     // ...and without one (the editor-wide tool path), no id is passed.
     await host.execute('run', { command: 'echo hi' });
     expect(seen).toEqual(['run-123', undefined]);
+    // The run tool's "Allow All" scope is forwarded both ways.
+    expect(scopes).toEqual(['run', 'run']);
   });
 
   it('run forwards the shared mirror to runCommand', async () => {
@@ -257,7 +279,11 @@ describe('WorkspaceToolHost', () => {
     const approver = makeApprover(false);
     const host = new WorkspaceToolHost(approver);
     const result = await host.execute('write', { path: 'src/new.ts', contents: 'x' });
-    expect(approver.calls[0]).toEqual({ title: 'Write file', detail: 'src/new.ts' });
+    expect(approver.calls[0]).toEqual({
+      title: 'Write file',
+      detail: 'src/new.ts',
+      scope: 'write',
+    });
     expect(result).toBe('Write was not approved by the user.');
     expect(__state.files.has('/ws/src/new.ts')).toBe(false);
   });
@@ -272,7 +298,11 @@ describe('WorkspaceToolHost', () => {
       oldText: 'a = 1',
       newText: 'a = 2',
     });
-    expect(approver.calls[0]).toEqual({ title: 'Edit file', detail: 'src/a.ts' });
+    expect(approver.calls[0]).toEqual({
+      title: 'Edit file',
+      detail: 'src/a.ts',
+      scope: 'edit',
+    });
     expect(result).toBe('Edited src/a.ts (1 replacement).');
     expect(__state.files.get('/ws/src/a.ts')).toBe('const a = 2;');
   });
@@ -372,8 +402,10 @@ describe('WorkspaceToolHost', () => {
 
   it('forwards the correlation id to an MCP approval prompt', async () => {
     const seen: Array<string | undefined> = [];
+    const scopes: string[] = [];
     const approver: Approver = {
-      confirm: async (_t, _d, correlationId) => {
+      confirm: async (_t, _d, scope, correlationId) => {
+        scopes.push(scope);
         seen.push(correlationId);
         return true;
       },
@@ -382,6 +414,9 @@ describe('WorkspaceToolHost', () => {
     const host = new WorkspaceToolHost(approver, undefined, undefined, mcp);
     await host.execute('mcp__fs__read', {}, undefined, 'run-9');
     expect(seen).toEqual(['run-9']);
+    // An MCP call's "Allow All" scope is the exact namespaced tool name, so the
+    // allowance never covers a sibling tool on the same server.
+    expect(scopes).toEqual(['mcp__fs__read']);
   });
 
   it('rejects an mcp-shaped name the invoker does not recognise', async () => {

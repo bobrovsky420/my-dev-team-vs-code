@@ -44,10 +44,17 @@ import { createEngineProvider } from '../src/client/engineFactory';
 import { AnonymousAuthProvider } from '../src/client/auth';
 import { LocalEngine } from '../src/engine/localEngine';
 import { SidecarEngine } from '../src/client/sidecarEngine';
+import { DebugChannel } from '../src/client/debugLog';
 import { setApiKey } from '../src/client/secrets';
 import { __reset, __setConfig, window, secrets } from './mocks/vscode';
 
 const SIDECAR_PATH = '/ext/dist/sidecar.js';
+
+/** The debug channel the provider requires; with `myDevTeam.debug` off (the test
+ *  default) the engine tracer is a pass-through, so engine identity is preserved. */
+function debug(): DebugChannel {
+  return new DebugChannel(window.createOutputChannel('test'));
+}
 
 beforeEach(async () => {
   __reset();
@@ -66,7 +73,7 @@ beforeEach(async () => {
 
 describe('createEngineProvider', () => {
   it('returns the local engine by default and memoises it', () => {
-    const { getEngine } = createEngineProvider(SIDECAR_PATH);
+    const { getEngine } = createEngineProvider(SIDECAR_PATH, debug());
     const first = getEngine();
     expect(first).toBeInstanceOf(LocalEngine);
     expect(first.kind).toBe('local');
@@ -77,7 +84,7 @@ describe('createEngineProvider', () => {
 
   it('falls back to local with one warning while remote is unavailable', () => {
     __setConfig('myDevTeam.engine', 'remote');
-    const { getEngine } = createEngineProvider(SIDECAR_PATH);
+    const { getEngine } = createEngineProvider(SIDECAR_PATH, debug());
 
     expect(getEngine().kind).toBe('local');
     getEngine();
@@ -87,7 +94,7 @@ describe('createEngineProvider', () => {
   });
 
   it('warns again only after switching away and back to remote', () => {
-    const { getEngine } = createEngineProvider(SIDECAR_PATH);
+    const { getEngine } = createEngineProvider(SIDECAR_PATH, debug());
     __setConfig('myDevTeam.engine', 'remote');
     getEngine();
     getEngine();
@@ -101,7 +108,7 @@ describe('createEngineProvider', () => {
 
   it('builds and reuses a sidecar engine when selected, and disposes it', () => {
     __setConfig('myDevTeam.engine', 'sidecar');
-    const provider = createEngineProvider(SIDECAR_PATH);
+    const provider = createEngineProvider(SIDECAR_PATH, debug());
 
     const engine = provider.getEngine();
     expect(engine).toBeInstanceOf(SidecarEngine);
@@ -119,7 +126,7 @@ describe('createEngineProvider', () => {
 
   it('respawns a fresh child after a crash, then gives up after repeated crashes', () => {
     __setConfig('myDevTeam.engine', 'sidecar');
-    const { getEngine } = createEngineProvider(SIDECAR_PATH);
+    const { getEngine } = createEngineProvider(SIDECAR_PATH, debug());
 
     expect(getEngine().kind).toBe('sidecar'); // fork 1
     forkedChildren[0].emit('exit', 1, null); // crash
@@ -142,7 +149,7 @@ describe('createEngineProvider', () => {
 
   it('re-arms the sidecar after the user switches engine away and back', () => {
     __setConfig('myDevTeam.engine', 'sidecar');
-    const { getEngine } = createEngineProvider(SIDECAR_PATH);
+    const { getEngine } = createEngineProvider(SIDECAR_PATH, debug());
     getEngine();
     forkedChildren[0].emit('exit', 1, null);
     getEngine();
@@ -162,7 +169,7 @@ describe('createEngineProvider', () => {
   it('warns once that the sidecar ignores a SecretStorage-only key', async () => {
     await setApiKey(secrets, 'openai', 'sk-stored'); // stored, no env var
     __setConfig('myDevTeam.engine', 'sidecar');
-    const { getEngine } = createEngineProvider(SIDECAR_PATH);
+    const { getEngine } = createEngineProvider(SIDECAR_PATH, debug());
 
     getEngine();
     getEngine();
@@ -176,7 +183,7 @@ describe('createEngineProvider', () => {
     process.env.OPENAI_API_KEY = 'sk-env';
     await setApiKey(secrets, 'openai', 'sk-stored');
     __setConfig('myDevTeam.engine', 'sidecar');
-    const { getEngine } = createEngineProvider(SIDECAR_PATH);
+    const { getEngine } = createEngineProvider(SIDECAR_PATH, debug());
 
     getEngine();
     expect(window.showWarningMessage).not.toHaveBeenCalled();
@@ -184,7 +191,7 @@ describe('createEngineProvider', () => {
 
   it('warns again only after switching away from and back to sidecar', async () => {
     await setApiKey(secrets, 'openai', 'sk-stored');
-    const { getEngine } = createEngineProvider(SIDECAR_PATH);
+    const { getEngine } = createEngineProvider(SIDECAR_PATH, debug());
     __setConfig('myDevTeam.engine', 'sidecar');
     getEngine();
     getEngine();

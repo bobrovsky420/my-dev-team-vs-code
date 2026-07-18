@@ -148,6 +148,15 @@ export class McpHub implements McpInvoker {
   }
 
   async listToolDefs(): Promise<DynamicToolDef[]> {
+    // Do not memoise the empty result from an untrusted workspace: discovery is
+    // gated on trust, so caching `[]` here would mean granting trust mid-session
+    // never surfaces the MCP tools (they would appear only after a window
+    // reload). Short-circuit without setting `this.discovery`, so the first call
+    // *after* trust is granted runs - and memoises - a real discovery. See
+    // FIX.md, finding B-3.
+    if (!vscode.workspace.isTrusted) {
+      return [];
+    }
     if (!this.discovery) {
       this.discovery = this.discover();
     }
@@ -156,7 +165,9 @@ export class McpHub implements McpInvoker {
 
   private async discover(): Promise<DynamicToolDef[]> {
     // Untrusted input: the server command comes from workspace configuration, so
-    // launch nothing until the workspace is trusted.
+    // launch nothing until the workspace is trusted. `listToolDefs` already gates
+    // on trust (and avoids memoising the empty result); this stays as a defensive
+    // guard for the private path.
     if (!vscode.workspace.isTrusted) {
       return [];
     }

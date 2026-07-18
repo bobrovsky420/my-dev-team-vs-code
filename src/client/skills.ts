@@ -1,10 +1,14 @@
 /**
  * Discovers the skills available to a run. Like the standing instruction file
  * (instructions.ts), this is client work by design: the engine is stateless and
- * has no filesystem access, so the client finds the SKILL.md files, reads them,
- * and ships the raw text on the request - the engine parses them and merges them
- * with its built-in skills. Reading fresh every request means an edit to a skill
- * takes effect on the very next message.
+ * has no filesystem access, so the client finds the SKILL.md files and reads
+ * them. It then ships only the **metadata** (name + description + source) on the
+ * request and keeps each skill's body to serve on demand: when the model loads a
+ * skill, the engine's `skill` tool calls back to the client (over the `tool`
+ * capability) and the handler returns the body from the map this builds. So an
+ * unused skill's body never crosses to the engine, and the engine bundles no
+ * skills of its own. Reading fresh every request means an edit to a skill takes
+ * effect on the next message.
  *
  * A skill lives at `<dir>/<name>/SKILL.md`, where `<dir>` is one of the
  * configured skills directories (`myDevTeam.skills.directories`, e.g.
@@ -12,15 +16,57 @@
  * two places: every workspace root (a skill committed to the project) and the
  * user's home directory (a personal skill shared across projects). Workspace
  * skills take precedence over home skills of the same name, so they are
- * collected first and the engine keeps the first occurrence of each name.
+ * collected first and the first occurrence of each name wins - both in the
+ * shipped metadata and in the body map.
  */
 import * as os from 'os';
 import * as vscode from 'vscode';
 import { WorkspaceSkill } from '../protocol/types';
 import { settings } from '../config/settings';
 import { truncateForDisplay } from '../config/messages';
+import { parseFrontmatter } from '../config/frontmatter';
 
 const SKILL_FILE = 'SKILL.md';
+
+/**
+ * What a run's skill discovery yields: the metadata to ship on the request, and
+ * the bodies (keyed by skill name) the handler serves on demand when the model's
+ * `skill` tool asks (through the `tool` capability). The two are kept in sync -
+ * one entry per winning name - so a `skill` call for any shipped skill resolves
+ * to its body.
+ */
+export interface CollectedSkills {
+  skills: WorkspaceSkill[];
+  bodies: Map<string, string>;
+}
+
+/**
+ * Pull a skill's name, description, and body out of its SKILL.md text using the
+ * shared frontmatter parser (the same one the engine's config loaders use, so
+ * the client and engine never disagree on what a skill is called). Returns
+ * undefined when the frontmatter is malformed or lacks a usable name, so a bad
+ * skill file is skipped rather than failing the turn.
+ */
+function parseSkill(
+  text: string
+): { name: string; description: string; body: string } | undefined {
+  let parsed;
+  try {
+    parsed = parseFrontmatter(text);
+  } catch {
+    return undefined;
+  }
+  const name = parsed.data.name;
+  if (typeof name !== 'string' || !name.trim()) {
+    return undefined;
+  }
+  const description = parsed.data.description;
+  return {
+    name: name.trim(),
+    description: typeof description === 'string' ? description.trim() : '',
+    body: parsed.body,
+  };
+}
 
 /** The user's home directory, or undefined when it cannot be determined. */
 function homeDirectory(): string | undefined {
@@ -49,18 +95,20 @@ function sourceLabel(file: vscode.Uri, home: string | undefined): string {
 /**
  * Find the skills available to this run: for each base location (workspace roots
  * first, then the home directory) and each configured directory, the SKILL.md
- * files one level below it, read and capped to `settings.skills.maxChars`, up to
- * `settings.skills.maxSkills` in total. Returns each file's raw text plus a
- * readable source label, **highest precedence first** (workspace before home),
- * so the engine resolves a name clash in the project's favour. Never throws and
- * returns an empty array when there is nowhere to look or the feature is
- * disabled (an empty directory list): a missing skill must never fail or delay
- * the turn.
+ * files one level below it, parsed for their metadata and body. Returns the
+ * metadata to ship (name + description + source) and a name->body map to serve
+ * on demand, **highest precedence first** (workspace before home), keeping the
+ * first occurrence of each name so a name clash resolves in the project's
+ * favour. Each body is capped to `settings.skills.maxChars`, up to
+ * `settings.skills.maxSkills` skills in total. Never throws and returns empty
+ * when there is nowhere to look or the feature is disabled (an empty directory
+ * list): a missing skill must never fail or delay the turn.
  */
-export async function collectSkills(): Promise<WorkspaceSkill[]> {
+export async function collectSkills(): Promise<CollectedSkills> {
+  const empty: CollectedSkills = { skills: [], bodies: new Map() };
   const dirs = settings.skills.directories;
   if (dirs.length === 0) {
-    return [];
+    return empty;
   }
 
   // Base locations, highest precedence first: each workspace root, then the
@@ -74,19 +122,21 @@ export async function collectSkills(): Promise<WorkspaceSkill[]> {
     bases.push(vscode.Uri.file(home));
   }
   if (bases.length === 0) {
-    return [];
+    return empty;
   }
 
   const max = settings.skills.maxChars;
   const skills: WorkspaceSkill[] = [];
-  // A workspace root could coincide with (or nest under) the home directory;
-  // de-duplicate by the SKILL.md path so the same file is never shipped twice.
-  const seen = new Set<string>();
+  const bodies = new Map<string, string>();
+  // De-duplicate twice: by SKILL.md path (the same file reached under two bases)
+  // and by skill name (a project skill shadows a personal one of the same name),
+  // keeping the first occurrence of each since bases are highest-precedence first.
+  const seenPaths = new Set<string>();
 
   for (const base of bases) {
     for (const dir of dirs) {
       if (skills.length >= settings.skills.maxSkills) {
-        return skills;
+        return { skills, bodies };
       }
       const root = vscode.Uri.joinPath(base, ...dir.split('/'));
       let entries: [string, vscode.FileType][];
@@ -95,16 +145,16 @@ export async function collectSkills(): Promise<WorkspaceSkill[]> {
       } catch {
         continue; // The directory does not exist here: nothing to read.
       }
-      for (const [name, type] of entries) {
+      for (const [entry, type] of entries) {
         if (skills.length >= settings.skills.maxSkills) {
-          return skills;
+          return { skills, bodies };
         }
         // Skills live in `<dir>/<name>/SKILL.md`; ignore stray files.
         if ((type & vscode.FileType.Directory) === 0) {
           continue;
         }
-        const file = vscode.Uri.joinPath(root, name, SKILL_FILE);
-        if (seen.has(file.path)) {
+        const file = vscode.Uri.joinPath(root, entry, SKILL_FILE);
+        if (seenPaths.has(file.path)) {
           continue;
         }
         let text: string;
@@ -117,10 +167,22 @@ export async function collectSkills(): Promise<WorkspaceSkill[]> {
         if (!text.trim()) {
           continue;
         }
-        seen.add(file.path);
-        skills.push({ source: sourceLabel(file, home), text: truncateForDisplay(text, max) });
+        seenPaths.add(file.path);
+        const skill = parseSkill(text);
+        // A malformed SKILL.md, or one whose name a higher-precedence skill
+        // already claimed, is skipped (so the shipped metadata and the body map
+        // stay one entry per winning name).
+        if (!skill || bodies.has(skill.name)) {
+          continue;
+        }
+        skills.push({
+          source: sourceLabel(file, home),
+          name: skill.name,
+          description: skill.description,
+        });
+        bodies.set(skill.name, truncateForDisplay(skill.body, max));
       }
     }
   }
-  return skills;
+  return { skills, bodies };
 }

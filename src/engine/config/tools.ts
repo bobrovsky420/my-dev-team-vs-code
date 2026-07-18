@@ -7,10 +7,10 @@
  * `{{os}}`/`{{shell}}` placeholders in a description are filled from
  * config/environment.ts, so a tool can state which OS and shell it runs in.
  *
- * The client-side half - input schemas, Language Model Tools ids, display
- * names - lives in the protocol's tool contract (src/protocol/toolContract.ts)
- * next to the implementations it describes; this registry holds only what the
- * engine's prompts and transcripts need.
+ * The client-side half - input schemas and display names - lives in the
+ * protocol's tool contract (src/protocol/toolContract.ts) next to the
+ * implementations it describes; this registry holds only what the engine's
+ * prompts and transcripts need.
  *
  * Agents list the tools they may use in their own frontmatter (see agents.ts);
  * `renderToolsSection` turns that list into the "available tools" prompt

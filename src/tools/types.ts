@@ -8,6 +8,19 @@
 import { DynamicToolDef } from '../protocol/types';
 
 /**
+ * The "Allow All" scopes the `run` tool gates with: one for ordinary commands,
+ * one for the commands the model flags as destructive (see the run tool's
+ * `dangerous` input). They are deliberately distinct so an allowance granted for
+ * ordinary commands never silently approves a destructive one - that asks again
+ * on its own scope. The relationship is one-directional, though: allowing all
+ * *destructive* commands also allows ordinary ones (the Approver treats the
+ * dangerous allowance as subsuming the ordinary one), since a user who waved
+ * through the riskier command would not want the safer one to keep asking.
+ */
+export const RUN_SCOPE = 'run';
+export const RUN_DANGEROUS_SCOPE = 'run:dangerous';
+
+/**
  * The MCP seam: the client's connection to user-configured MCP servers, behind
  * an interface so the tool host (and tests) depend on a shape, not on the
  * concrete McpHub (client/mcp.ts) or the MCP SDK. The host routes any tool
@@ -29,6 +42,23 @@ export interface McpInvoker {
 }
 
 /**
+ * An optional "Always allow commands like this" choice on an approval prompt.
+ * When the `run` tool offers one (only for an ordinary, non-destructive
+ * command), the approver renders a third button alongside Approve / Allow All;
+ * picking it approves this call and `apply`s the rule - appending the command's
+ * leading prefix to the user's `myDevTeam.run.allowedCommands`, so later
+ * matching commands skip the prompt across conversations and sessions. Unlike
+ * "Allow All" (an in-memory, per-conversation grant), this persists. A
+ * client-side seam, so a callback is fine here - it never crosses the protocol.
+ */
+export interface AlwaysAllowOption {
+  /** The button label, e.g. "Always allow `git status`". */
+  label: string;
+  /** Persist the rule; awaited (best-effort) when the user picks the choice. */
+  apply(): Promise<void>;
+}
+
+/**
  * The approval seam. Phase 1 implements this with chat confirmation buttons.
  * Phase 2 (Webview) implements the SAME interface with a rich diff/confirm
  * dialog. The agent core only ever calls `confirm()` and never knows which.
@@ -38,13 +68,30 @@ export interface Approver {
    * Ask the user to approve a side-effecting action.
    * @param title   Short label, e.g. "Run command".
    * @param detail  The specific thing about to happen (command text, diff…).
+   * @param scope   A stable key naming the *kind* of action, used by the "Allow
+   *   All" choice to remember a per-conversation allowance: the tool name for
+   *   the built-in tools (`run`, `write`, `edit`) and the namespaced tool name
+   *   for an MCP call. Allowances are kept separate per scope, so "Allow All"
+   *   for `write` never also allows `edit`, and approving one MCP tool never
+   *   allows a sibling. The allowance lasts only for the current chat
+   *   conversation - a new chat (or /clear) starts asking again.
    * @param correlationId  Optional id of the run the call belongs to, so a
    *   front-end with concurrent sessions (the ChatApprover) can render the
    *   prompt in the session that owns the call rather than the most recent one.
-   *   Omitted by the editor-wide tool path, which has no owning run.
+   *   Omitted only on a defensive no-owning-run path (a confirm with no session).
+   * @param alwaysAllow  Optional persistent "always allow commands like this"
+   *   choice (only the `run` tool, only for an ordinary command). When present,
+   *   the approver offers it as a third button; picking it approves the call and
+   *   `apply`s the rule.
    * @returns true if the user approved.
    */
-  confirm(title: string, detail: string, correlationId?: string): Promise<boolean>;
+  confirm(
+    title: string,
+    detail: string,
+    scope: string,
+    correlationId?: string,
+    alwaysAllow?: AlwaysAllowOption
+  ): Promise<boolean>;
 }
 
 /**

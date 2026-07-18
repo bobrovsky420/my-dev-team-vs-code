@@ -3,6 +3,7 @@ import type { RequestContext } from '@mastra/core/request-context';
 import { z } from 'zod';
 import { Triage, TriageSchema } from './triage';
 import { Planner, PlanProgress } from './planner';
+import { Responder, ResponderProgressSink } from './responder';
 import { Answerer } from './answerer';
 import { Executor, ExecutionProgress } from './executor';
 import { Summarizer, SummaryProgress } from './summarizer';
@@ -10,11 +11,17 @@ import { AgentUsage, estimateTokens } from './usage';
 import { commandConfigs, pinnedReason, CommandConfig } from '../config/commands';
 import { resolveSkills, renderSkillsSection, SkillSummary } from '../config/skills';
 import { runtimeConfig } from '../../config/runtimeConfig';
+import { normalizeQuestions } from './clarify';
 import {
   Attachment,
   AttachmentSchema,
+  CheckpointInfo,
+  ClarifyQuestion,
+  ClarifyQuestionSchema,
   Complexity,
   ComplexitySchema,
+  ContextWarning,
+  ContinueDecision,
   Execution,
   HistoryTurn,
   HistoryTurnSchema,
@@ -45,6 +52,25 @@ export const stepIds = {
   triage: 'triage',
   plan: 'draft-plan',
   answer: 'answer-directly',
+  /**
+   * The combined-mode step: one model call does triage and produces either the
+   * answer or the plan, replacing the triage + draft-plan/answer-directly trio.
+   * Only the combined workflow has it (see createDevTeamWorkflow).
+   */
+  respond: 'respond',
+  /**
+   * The direct route's branch arm (classifier mode): a small, well-specified
+   * change that skips the planner and goes straight to the execute step with no
+   * plan. A pass-through that just surfaces the route and carries the request.
+   */
+  direct: 'stage-direct',
+  /**
+   * The clarify route's branch arm: a terminal pass-through that carries the
+   * questions to ask the user. Like the direct stage it surfaces the route and
+   * carries the request, but it never reaches the executor - the run ends with
+   * the questions and the user's reply continues it on the next turn.
+   */
+  clarify: 'stage-clarify',
   execute: 'execute-plan',
   deliver: 'deliver-answer',
 } as const;
@@ -177,17 +203,18 @@ export function fullPrompt(input: RequestInput): string {
  */
 export function executionPrompt(
   input: RequestInput,
-  plan: Plan,
+  plan: Plan | undefined,
   skills: readonly SkillSummary[] = []
 ): string {
   const skillsSection = renderSkillsSection(skills);
-  return [
-    fullPrompt(input),
-    skillsSection,
-    `--- Drafted plan ---\n${planText(plan)}`,
-  ]
-    .filter(Boolean)
-    .join('\n\n');
+  // The planning route briefs the executor with the drafted plan; the direct
+  // route (a small, well-specified change) has none, so it is told to carry out
+  // the request directly instead.
+  const task = plan
+    ? `--- Drafted plan ---\n${planText(plan)}`
+    : `--- Task ---\nNo plan was drafted: this is a small, well-specified change. ` +
+      `Carry out the request above directly with the tools, then report what you did.`;
+  return [fullPrompt(input), skillsSection, task].filter(Boolean).join('\n\n');
 }
 
 /**
@@ -242,10 +269,15 @@ function transcriptText(execution: Execution): string {
  * transcript it should recap. The transcript is the source of truth for what
  * actually happened, so it comes last and clearly delimited.
  */
-export function summaryPrompt(input: RequestInput, plan: Plan, execution: Execution): string {
+export function summaryPrompt(
+  input: RequestInput,
+  plan: Plan | undefined,
+  execution: Execution
+): string {
+  const planSection = plan ? `--- Drafted plan ---\n${planText(plan)}\n\n` : '';
   return (
     `${fullPrompt(input)}\n\n` +
-    `--- Drafted plan ---\n${planText(plan)}\n\n` +
+    planSection +
     `--- Execution transcript ---\n${transcriptText(execution)}`
   );
 }
@@ -317,6 +349,11 @@ export function inputBreakdown(
  */
 const TriagedSchema = RequestSchema.extend(TriageSchema.shape).extend({
   complexity: ComplexitySchema.optional(),
+  // Override TriageSchema's generation-shaped `questions` (which carries
+  // describe() prompt material and a min/max on options) with the protocol's
+  // wire shape: the triage step normalises the model's questions to this before
+  // carrying them, and the clarify route delivers exactly this to the client.
+  questions: z.array(ClarifyQuestionSchema).optional(),
 });
 
 /**
@@ -418,6 +455,25 @@ function thinkingSink(requestContext: RequestContext): ThinkingSink | undefined 
   return requestContext.get(thinkingSinkKey) as ThinkingSink | undefined;
 }
 
+/**
+ * Receives a context-usage caution when the executor's run first crosses a
+ * configured threshold of the model's window. A side-channel like the thinking
+ * and usage sinks: the LocalEngine forwards each as a `context-warning` event,
+ * never folded into the reply. Must not throw.
+ */
+export type ContextWarningSink = (warning: ContextWarning) => void;
+
+/**
+ * RequestContext key under which a caller may pass a `ContextWarningSink`. The
+ * execute step hands it to the executor, which decides when to warn from the
+ * model's window and the `myDevTeam.executor.contextWarnThresholds` setting.
+ */
+export const contextWarningKey = 'onContextWarning';
+
+function contextWarningSink(requestContext: RequestContext): ContextWarningSink | undefined {
+  return requestContext.get(contextWarningKey) as ContextWarningSink | undefined;
+}
+
 /** Receives triage's prediction on a pinned run when shadow triage is on. */
 export type TriageShadowSink = (predicted: Intent) => void;
 
@@ -464,6 +520,124 @@ function planReview(requestContext: RequestContext): PlanReview | undefined {
 }
 
 /**
+ * Asks the user, at a periodic executor check-in, whether to keep working or
+ * stop and summarize. The engine-side handle on the client's
+ * `RunClient.confirmContinue`. Absent (no client seam) means the executor never
+ * checks in and runs to its step ceiling.
+ */
+export type ContinuePrompt = (info: CheckpointInfo) => Promise<ContinueDecision>;
+
+/**
+ * RequestContext key under which the LocalEngine passes a `ContinuePrompt` bound
+ * to the run's client. The execute step hands it to the executor, which decides
+ * (with the `myDevTeam.executor.checkpoint*` intervals) when to pause.
+ */
+export const continueReviewKey = 'onContinueReview';
+
+function continueReview(requestContext: RequestContext): ContinuePrompt | undefined {
+  return requestContext.get(continueReviewKey) as ContinuePrompt | undefined;
+}
+
+// The planner's `clarify` tool and the executor's `skill` tool are no longer
+// wired through dedicated request-context seams: they are ordinary model tools
+// that delegate to the client through the host's single `tool` capability (the
+// planner builds `clarify` when the run's offered tools include it). So the
+// workflow needs no clarify/skill plumbing - only the host, which the
+// planner/executor factories already carry.
+
+/**
+ * The sinks every planner run threads through besides its plan-progress and
+ * usage reporters: the run's cancellation signal, a reasoning model's live
+ * thinking (gated by the setting, like the answerer/executor), the periodic
+ * check-in, and the context-usage warning - the same side-channels the executor
+ * gets, now that the planner drives a tool-calling loop of its own. Gathered
+ * once so the several planner call sites stay in sync.
+ */
+function plannerSinks(requestContext: RequestContext): {
+  signal?: AbortSignal;
+  onThinking?: ThinkingSink;
+  onCheckpoint?: ContinuePrompt;
+  onContextWarning?: ContextWarningSink;
+} {
+  return {
+    signal: abortSignal(requestContext),
+    onThinking: runtimeConfig().thinkingShowInChat ? thinkingSink(requestContext) : undefined,
+    onCheckpoint: continueReview(requestContext),
+    onContextWarning: contextWarningSink(requestContext),
+  };
+}
+
+/**
+ * Whether a "direct" route must be escalated to the planning path so the user
+ * can approve it. The direct route has no plan and so bypasses the approval
+ * gate; that is fine under `auto`/`never` (a small change would not gate
+ * anyway), but a user on `always` asked to approve *every* change, so a direct
+ * change is drafted into a plan instead. Only when a review seam is actually
+ * wired - with no seam there is no approval to honour, so escalating would just
+ * add a pointless planner call.
+ */
+function escalatesDirect(requestContext: RequestContext): boolean {
+  return planReview(requestContext) !== undefined && runtimeConfig().planApproval === 'always';
+}
+
+/**
+ * Whether a "clarify" decision should actually ask the user, given the
+ * normalised questions and the `myDevTeam.clarify.enabled` setting. A clarify
+ * route with no usable question, or with clarifying turned off, is coerced back
+ * to a normal answer by the caller - so the run always produces work rather than
+ * a dead-end question.
+ */
+function clarifies(questions: ClarifyQuestion[]): boolean {
+  return runtimeConfig().clarifyEnabled && questions.length > 0;
+}
+
+/**
+ * The plan-approval gate, shared by the classic draft-plan step and the
+ * combined respond step. It only engages when the client offered the review
+ * seam and the run would actually execute (not a /plan run); the
+ * `myDevTeam.planApproval` setting then decides whether to pause: `always` on
+ * every plan, `auto` only when the plan was judged `complex`. The user can
+ * approve (proceed), cancel (deliver the plan only), or revise - `redraft`
+ * re-plans with their comment appended and the loop asks again. `view` is the
+ * route/complexity/reason the snapshots render against; `sink` re-pushes the
+ * complete plan before each prompt, since the streamed partials may trail the
+ * final object.
+ */
+async function gatePlan(
+  initial: Plan,
+  redraft: (revisionPrompt: string) => Promise<Plan>,
+  inputData: RequestInput,
+  requestContext: RequestContext,
+  view: { intent: Intent; complexity?: Complexity; reason: string },
+  sink: ReplyProgressSink | undefined
+): Promise<{ plan: Plan; proceed: boolean }> {
+  let plan = initial;
+  const review = planReview(requestContext);
+  const canGate = review !== undefined && commandFor(inputData)?.execute !== false;
+  const gates = (p: Plan): boolean => {
+    if (!canGate) {
+      return false;
+    }
+    const mode = runtimeConfig().planApproval;
+    return mode === 'always' || (mode === 'auto' && p.complexity === 'complex');
+  };
+  let proceed = true;
+  while (gates(plan)) {
+    sink?.({ ...view, plan });
+    const decision = await review!(plan, plan.complexity ?? view.complexity ?? 'moderate');
+    if (decision.kind === 'approve') {
+      break;
+    }
+    if (decision.kind === 'cancel') {
+      proceed = false;
+      break;
+    }
+    plan = await redraft(revisionPrompt(inputData, decision.comment));
+  }
+  return { plan, proceed };
+}
+
+/**
  * The agent's orchestration as a Mastra workflow:
  *
  *   triage ──▶ branch ──▶ draft-plan       (intent === "planning")
@@ -488,21 +662,27 @@ export function createDevTeamWorkflow(
   triage: Triage,
   // A factory, not an instance: the planner's model is sized by triage's
   // complexity, decided once the run is under way, so it is built in the
-  // draft-plan step rather than up front (mirroring the executor factory).
+  // draft-plan step rather than up front (mirroring the executor factory). Its
+  // `clarify` tool is built from the run's offered tools (it reaches the client
+  // through the host like any other tool), so no clarify seam is threaded here.
   makePlanner: (complexity?: Complexity) => Planner,
   answerer: Answerer,
   // A factory, not an instance: the executor's model is sized by the request's
   // complexity, which triage only decides once the run is under way, so it is
-  // built in the execute step rather than up front. The execute step also hands
-  // it the run's resolved skill bodies, so its `skill` tool can load them.
-  makeExecutor: (
-    complexity?: Complexity,
-    skillBodies?: ReadonlyMap<string, string>
-  ) => Executor,
+  // built in the execute step rather than up front. Its `skill` tool reaches the
+  // client through the host like any other tool, so no skill loader is threaded.
+  makeExecutor: (complexity?: Complexity) => Executor,
   // Optional: when supplied (and the setting is on), the execute step ends by
   // summarizing the change. Left out by tests that do not exercise the summary,
   // so the execute step then simply produces no summary.
-  makeSummarizer?: () => Summarizer
+  makeSummarizer?: () => Summarizer,
+  // Optional: when supplied, the workflow runs in combined mode - a single
+  // `respond` step does triage and produces the answer or plan in one model
+  // call, instead of the triage + draft-plan/answer-directly trio. Selected by
+  // `myDevTeam.triage.mode` = "combined". A slash command still pins the route
+  // and uses the dedicated planner/answerer inside the respond step, so /plan
+  // and /fix keep their behaviour; only the unpinned path uses the responder.
+  makeResponder?: () => Responder
 ) {
   const triageStep = createStep({
     id: stepIds.triage,
@@ -538,6 +718,23 @@ export function createDevTeamWorkflow(
           usageReporter(requestContext, 'triage')
         );
       }
+      // The clarify route's questions, normalised to the wire shape. A "clarify"
+      // decision with no usable question (or with clarifying turned off) is
+      // coerced to "oneshot" below, so the answerer answers rather than the run
+      // dead-ending on a question. Triage is routing-only, so the coercion is
+      // just a route swap - the answerer produces the body.
+      const questions = normalizeQuestions(decision.questions);
+      let intent: Intent = decision.intent;
+      if (intent === 'clarify' && !clarifies(questions)) {
+        intent = 'oneshot';
+      }
+      // Escalate a "direct" route to "planning" when the user approves every
+      // plan (planApproval = "always" with a review seam): a direct change has
+      // no plan to approve, so it is drafted into one instead. No-op for any
+      // other intent or setting (a command never pins "direct").
+      if (intent === 'direct' && escalatesDirect(requestContext)) {
+        intent = 'planning';
+      }
       return {
         prompt: inputData.prompt,
         instructions: inputData.instructions,
@@ -546,6 +743,8 @@ export function createDevTeamWorkflow(
         skills: inputData.skills,
         command: inputData.command,
         ...decision,
+        intent,
+        questions: intent === 'clarify' ? questions : undefined,
       };
     },
   });
@@ -565,51 +764,35 @@ export function createDevTeamWorkflow(
       const onPartial: PlanProgress | undefined =
         sink && ((partial) => sink({ intent, complexity, reason, plan: partial }));
       // The planner's model is sized by triage's (pre-exploration) complexity;
-      // the executor's, later, by the planner's own (post-exploration) one.
+      // the executor's, later, by the planner's own (post-exploration) one. Now
+      // that the planner explores with its own tools, that complexity is a real
+      // post-exploration read.
       const planner = makePlanner(complexity);
+      const sinks = plannerSinks(requestContext);
       const draft = (revision?: string) =>
         planner.plan(
           revision ?? fullPrompt(inputData),
           onPartial,
-          usageReporter(requestContext, 'plan', inputBreakdown(inputData))
+          usageReporter(requestContext, 'plan', inputBreakdown(inputData)),
+          sinks.signal,
+          sinks.onThinking,
+          sinks.onCheckpoint,
+          sinks.onContextWarning
         );
 
-      let plan = await draft();
-
-      // The plan-approval gate. It only engages when the client offered the
-      // review seam and the run would actually execute (not a /plan run); the
-      // `myDevTeam.planApproval` setting then decides whether to pause: `always`
-      // on every plan, `auto` only when the planner judged the work `complex`.
-      // The user can approve (proceed), cancel (deliver the plan only), or
-      // revise - re-planning with their comment appended and asking again.
-      const review = planReview(requestContext);
-      const canGate = review !== undefined && commandFor(inputData)?.execute !== false;
-      const gates = (p: Plan): boolean => {
-        if (!canGate) {
-          return false;
-        }
-        const mode = runtimeConfig().planApproval;
-        return mode === 'always' || (mode === 'auto' && p.complexity === 'complex');
-      };
-      let proceed = true;
-      while (gates(plan)) {
-        // Make sure the complete plan is rendered before the approval prompt:
-        // the streamed partials may trail the final object.
-        sink?.({ intent, complexity, reason, plan });
-        const decision = await review!(plan, plan.complexity ?? complexity ?? 'moderate');
-        if (decision.kind === 'approve') {
-          break;
-        }
-        if (decision.kind === 'cancel') {
-          proceed = false;
-          break;
-        }
-        plan = await draft(revisionPrompt(inputData, decision.comment));
-      }
+      const plan = await draft();
+      const { plan: gated, proceed } = await gatePlan(
+        plan,
+        (revision) => draft(revision),
+        inputData,
+        requestContext,
+        { intent, complexity, reason },
+        sink
+      );
 
       return {
-        prompt, instructions, attachments, history, skills, command, intent, complexity, reason, plan,
-        proceed,
+        prompt, instructions, attachments, history, skills, command, intent, complexity, reason,
+        plan: gated, proceed,
       };
     },
   });
@@ -637,6 +820,237 @@ export function createDevTeamWorkflow(
     },
   });
 
+  // The direct route (classifier mode): a small, well-specified change that
+  // skips the planner. A pass-through that surfaces the route and carries the
+  // request forward; the execute step then runs the executor with no plan.
+  // (Escalation to "planning" already happened in triage, so a request reaching
+  // here genuinely runs plan-less.)
+  const directStage = createStep({
+    id: stepIds.direct,
+    inputSchema: TriagedSchema,
+    outputSchema: StagedReplySchema,
+    execute: async ({ inputData, requestContext }) => {
+      const { prompt, instructions, attachments, history, skills, command, intent, complexity, reason } =
+        inputData;
+      progressSink(requestContext)?.({ intent, complexity, reason });
+      return { prompt, instructions, attachments, history, skills, command, intent, complexity, reason };
+    },
+  });
+
+  // The clarify route: a terminal pass-through that surfaces the route and
+  // carries the questions to ask. Like the direct stage it never drafts a plan;
+  // unlike it, it never reaches the executor either (shouldExecute is false with
+  // no plan and intent !== "direct"), so the run ends at deliver-answer with the
+  // questions. The triage step already normalised them and honoured the
+  // clarify-enabled setting, so a request reaching here genuinely asks.
+  const clarifyStage = createStep({
+    id: stepIds.clarify,
+    inputSchema: TriagedSchema,
+    outputSchema: StagedReplySchema,
+    execute: async ({ inputData, requestContext }) => {
+      const { prompt, instructions, attachments, history, command, intent, complexity, reason, questions } =
+        inputData;
+      progressSink(requestContext)?.({ intent, complexity, reason, questions });
+      return { prompt, instructions, attachments, history, command, intent, complexity, reason, questions };
+    },
+  });
+
+  // The combined-mode step: triage + answer/plan in one model call. Built only
+  // when a responder factory was supplied. A slash command still pins the route
+  // and falls back to the dedicated planner/answerer (so /plan stays plan-only
+  // and /fix keeps its complexity); only an unpinned request uses the responder.
+  const respond = createStep({
+    id: stepIds.respond,
+    inputSchema: RequestSchema,
+    outputSchema: StagedReplySchema,
+    execute: async ({ inputData, requestContext }) => {
+      const { prompt, instructions, attachments, history, skills, command } = inputData;
+      const carry = { prompt, instructions, attachments, history, skills, command };
+      const sink = progressSink(requestContext);
+
+      // Pinned route: the user typed a command, so the responder's routing is
+      // not wanted. Run the dedicated planner/answerer exactly as the classic
+      // steps do, preserving /plan's plan-only stop and /fix's complexity.
+      const pinned = commandFor(inputData);
+      if (pinned) {
+        const intent = pinned.intent;
+        const complexity = pinned.complexity;
+        const reason = pinnedReason(pinned.name);
+        sink?.({ intent, complexity, reason });
+        if (intent === 'planning') {
+          const onPlan: PlanProgress | undefined =
+            sink && ((partial) => sink({ intent, complexity, reason, plan: partial }));
+          const planner = makePlanner(complexity);
+          const sinks = plannerSinks(requestContext);
+          const draft = (revision?: string) =>
+            planner.plan(
+              revision ?? fullPrompt(inputData),
+              onPlan,
+              usageReporter(requestContext, 'plan', inputBreakdown(inputData)),
+              sinks.signal,
+              sinks.onThinking,
+              sinks.onCheckpoint,
+              sinks.onContextWarning
+            );
+          const drafted = await draft();
+          const { plan, proceed } = await gatePlan(
+            drafted,
+            (revision) => draft(revision),
+            inputData,
+            requestContext,
+            { intent, complexity, reason },
+            sink
+          );
+          return { ...carry, intent, complexity, reason, plan, proceed };
+        }
+        const answer = await answerer.answer(
+          fullPrompt(inputData),
+          sink && ((text) => sink({ intent, complexity, reason, answer: text })),
+          usageReporter(requestContext, 'answer', inputBreakdown(inputData)),
+          runtimeConfig().thinkingShowInChat ? thinkingSink(requestContext) : undefined
+        );
+        return { ...carry, intent, complexity, reason, answer };
+      }
+
+      // Unpinned route: one responder call routes and produces the work. The
+      // route is not known until the model commits its `intent` mid-stream, so
+      // the usage step is tagged from the partial that carries it (set before
+      // the usage report fires, which is after the stream is drained).
+      const responder = makeResponder!();
+      let routeStep: RunStep = 'answer';
+      const onPartial: ResponderProgressSink = (partial) => {
+        // Withhold the first snapshot until the reason is known too, so the
+        // triage block never renders an empty reason; reason precedes the
+        // answer/plan body in the schema, so this only delays the very start.
+        if (!partial.reason) {
+          return;
+        }
+        if (partial.intent === 'planning') {
+          routeStep = 'plan';
+          sink?.({
+            intent: 'planning',
+            complexity: partial.complexity,
+            reason: partial.reason,
+            plan: partial.plan,
+          });
+        } else if (partial.intent === 'oneshot') {
+          routeStep = 'answer';
+          sink?.({
+            intent: 'oneshot',
+            complexity: partial.complexity,
+            reason: partial.reason,
+            answer: partial.answer,
+          });
+        } else if (partial.intent === 'clarify') {
+          // "clarify": the route and reason stream now; the questions arrive
+          // whole after the call. Metered as "answer" - the responder produced
+          // the questions, so its tokens attribute to that step.
+          routeStep = 'answer';
+          sink?.({
+            intent: 'clarify',
+            complexity: partial.complexity,
+            reason: partial.reason,
+          });
+        } else {
+          // "direct" is a routing-only decision (no streamed body). Don't surface
+          // a snapshot yet - whether it stays "direct" or is escalated to
+          // "planning" (approve-every-plan) is decided after the call, so the
+          // route is emitted then. The responder's own call meters as triage.
+          routeStep = 'triage';
+        }
+      };
+      const reportUsage = (usage: AgentUsage) =>
+        usageReporter(requestContext, routeStep, inputBreakdown(inputData))?.(usage);
+      const decision = await responder.respond(fullPrompt(inputData), onPartial, reportUsage);
+
+      if (decision.intent === 'oneshot') {
+        const { complexity, reason, answer } = decision;
+        sink?.({ intent: 'oneshot', complexity, reason, answer });
+        return { ...carry, intent: 'oneshot', complexity, reason, answer };
+      }
+
+      // Clarify route: end the run with the questions - unless clarifying is off
+      // or the model produced no usable question, in which case fall back to a
+      // normal answer (the responder cannot answer and ask in one call, so this
+      // is a fresh answerer call rather than a coercion of the same object).
+      if (decision.intent === 'clarify') {
+        const { complexity, reason, questions } = decision;
+        if (clarifies(questions)) {
+          sink?.({ intent: 'clarify', complexity, reason, questions });
+          return { ...carry, intent: 'clarify', complexity, reason, questions };
+        }
+        const fallbackReason = 'Answered with a reasonable assumption (clarifying questions are turned off).';
+        sink?.({ intent: 'oneshot', complexity, reason: fallbackReason });
+        const answer = await answerer.answer(
+          fullPrompt(inputData),
+          sink && ((text) => sink({ intent: 'oneshot', complexity, reason: fallbackReason, answer: text })),
+          usageReporter(requestContext, 'answer', inputBreakdown(inputData)),
+          runtimeConfig().thinkingShowInChat ? thinkingSink(requestContext) : undefined
+        );
+        return { ...carry, intent: 'oneshot', complexity, reason: fallbackReason, answer };
+      }
+
+      // Direct route: hand it straight to the executor with no plan - unless the
+      // user approves every plan, in which case it is drafted into one so it can
+      // gate (escalation, the same rule the classic triage step applies).
+      if (decision.intent === 'direct') {
+        const { complexity, reason } = decision;
+        if (escalatesDirect(requestContext)) {
+          const planner = makePlanner(complexity);
+          const sinks = plannerSinks(requestContext);
+          const draft = (revision?: string) =>
+            planner.plan(
+              revision ?? fullPrompt(inputData),
+              sink && ((partial) => sink({ intent: 'planning', complexity, reason, plan: partial })),
+              usageReporter(requestContext, 'plan', inputBreakdown(inputData)),
+              sinks.signal,
+              sinks.onThinking,
+              sinks.onCheckpoint,
+              sinks.onContextWarning
+            );
+          const drafted = await draft();
+          const { plan, proceed } = await gatePlan(
+            drafted,
+            (revision) => draft(revision),
+            inputData,
+            requestContext,
+            { intent: 'planning', complexity, reason },
+            sink
+          );
+          return { ...carry, intent: 'planning', complexity, reason, plan, proceed };
+        }
+        sink?.({ intent: 'direct', complexity, reason });
+        return { ...carry, intent: 'direct', complexity, reason };
+      }
+
+      const { complexity, reason } = decision;
+      sink?.({ intent: 'planning', complexity, reason, plan: decision.plan });
+      // Revisions re-draft with the dedicated planner: the run is already
+      // committed to planning, so the responder's routing is no longer needed.
+      const revisionSinks = plannerSinks(requestContext);
+      const revisionPlanner = makePlanner(complexity);
+      const redraft = (revision: string) =>
+        revisionPlanner.plan(
+          revision,
+          sink && ((partial) => sink({ intent: 'planning', complexity, reason, plan: partial })),
+          usageReporter(requestContext, 'plan', inputBreakdown(inputData)),
+          revisionSinks.signal,
+          revisionSinks.onThinking,
+          revisionSinks.onCheckpoint,
+          revisionSinks.onContextWarning
+        );
+      const { plan, proceed } = await gatePlan(
+        decision.plan,
+        redraft,
+        inputData,
+        requestContext,
+        { intent: 'planning', complexity, reason },
+        sink
+      );
+      return { ...carry, intent: 'planning', complexity, reason, plan, proceed };
+    },
+  });
+
   const executePlan = createStep({
     id: stepIds.execute,
     inputSchema: StagedReplySchema,
@@ -644,7 +1058,9 @@ export function createDevTeamWorkflow(
     execute: async ({ inputData, requestContext }) => {
       const { prompt, instructions, attachments, history, command, intent, complexity, reason, plan } =
         inputData;
-      if (!plan) {
+      // The planning route always carries a plan here; the direct route carries
+      // none (it skipped the planner). Only a planning run with no plan is a bug.
+      if (!plan && intent !== 'direct') {
         throw new Error('execute-plan reached without a drafted plan.');
       }
       const sink = progressSink(requestContext);
@@ -654,16 +1070,18 @@ export function createDevTeamWorkflow(
       const onPartial: ExecutionProgress | undefined =
         sink && ((partial) => sink({ intent, complexity, reason, plan, execution: partial }));
       const executorInput = { prompt, instructions, attachments, history, command };
-      // Merge the built-in skills with the run's workspace skills: the catalogue
-      // (name + description) goes into the executor's prompt; the bodies back its
-      // `skill` tool, loaded on demand.
-      const { catalogue, bodies } = resolveSkills(inputData.skills);
+      // The run's skill catalogue (name + description) from the request metadata,
+      // de-duped: it goes into the executor's prompt, and the executor's `skill`
+      // tool fetches a body on demand through the client (the engine ships with no
+      // skills and the request carries no bodies) - the `skill` tool delegates to
+      // the client over the host's `tool` capability, like any other tool.
+      const catalogue = resolveSkills(inputData.skills);
       // Size the executor by the planner's post-exploration complexity when it
-      // judged one, falling back to triage's pre-exploration value otherwise.
-      // The planner has seen the workspace, so its read is the better one to
-      // route the heavy step on; and with the run's skill bodies so its `skill`
-      // tool can serve them.
-      const executor = makeExecutor(plan.complexity ?? complexity, bodies);
+      // judged one, falling back to triage's pre-exploration value otherwise (the
+      // direct route has no plan, so it sizes by triage's read - a direct change
+      // is "simple"). The planner has seen the workspace, so its read is the
+      // better one to route the heavy step on.
+      const executor = makeExecutor(plan?.complexity ?? complexity);
       const execution = await executor.execute(
         executionPrompt(executorInput, plan, catalogue),
         onPartial,
@@ -671,7 +1089,13 @@ export function createDevTeamWorkflow(
         usageReporter(requestContext, 'execute', inputBreakdown(executorInput, plan, catalogue)),
         // Surface the executor's thinking live, gated by the setting so turning
         // it off does no extra work (a side-channel, not the transcript).
-        runtimeConfig().thinkingShowInChat ? thinkingSink(requestContext) : undefined
+        runtimeConfig().thinkingShowInChat ? thinkingSink(requestContext) : undefined,
+        // The periodic check-in seam: present only when the client offered it,
+        // so a client without `confirmContinue` runs straight to the ceiling.
+        continueReview(requestContext),
+        // The context-usage warning sink (side-channel like thinking); absent
+        // means no warnings are emitted.
+        contextWarningSink(requestContext)
       );
       const base = { intent, complexity, reason, plan, execution };
 
@@ -717,32 +1141,65 @@ export function createDevTeamWorkflow(
       reason: inputData.reason,
       plan: inputData.plan,
       answer: inputData.answer,
+      // The clarify route ends here, carrying its questions to the client.
+      questions: inputData.questions,
     }),
   });
 
-  // A drafted plan is executed unless the run's slash command opted out
-  // (/plan stops after drafting, so the user can inspect the steps first) or
-  // the user cancelled at the approval gate (`proceed === false`).
+  // The execute step runs for a drafted plan, or for the direct route (which has
+  // no plan but still changes the workspace). It is skipped when the run's slash
+  // command opted out (/plan stops after drafting) or the user cancelled at the
+  // approval gate (`proceed === false`). The direct route never gates and no
+  // command opts it out, so it always reaches the executor.
   const shouldExecute = async ({ inputData }: { inputData: StagedReply }) =>
-    inputData.plan !== undefined &&
+    (inputData.plan !== undefined || inputData.intent === 'direct') &&
     inputData.proceed !== false &&
     commandFor(inputData)?.execute !== false;
 
   // The generics are explicit because TS cannot infer them from the zod
   // schemas: a zod v4 schema matches more than one member of Mastra's
   // PublicSchema union, so inference collapses TInput/TOutput to `unknown`.
-  return createWorkflow<'dev-team', unknown, RequestInput, ReplyResult>({
-    id: 'dev-team',
-    inputSchema: RequestSchema,
-    outputSchema: ReplySchema,
-  })
+  const base = () =>
+    createWorkflow<'dev-team', unknown, RequestInput, ReplyResult>({
+      id: 'dev-team',
+      inputSchema: RequestSchema,
+      outputSchema: ReplySchema,
+    });
+
+  // Combined mode: a single `respond` step yields the staged reply directly
+  // (the answer, or the plan to execute), so the triage + draft-plan/answer
+  // branch collapses into it. The execute-vs-deliver branch below is unchanged -
+  // the staged reply already carries either an answer or a plan.
+  if (makeResponder) {
+    return base()
+      .then(respond)
+      .branch([
+        [shouldExecute, executePlan],
+        [
+          async (args: { inputData: StagedReply }) => !(await shouldExecute(args)),
+          deliverAnswer,
+        ],
+      ])
+      .map(async ({ inputData }) => inputData[stepIds.execute] ?? inputData[stepIds.deliver])
+      .commit();
+  }
+
+  return base()
     .then(triageStep)
     .branch([
       [async ({ inputData }) => inputData.intent === 'planning', draftPlan],
-      [async ({ inputData }) => inputData.intent !== 'planning', answerDirectly],
+      [async ({ inputData }) => inputData.intent === 'oneshot', answerDirectly],
+      [async ({ inputData }) => inputData.intent === 'direct', directStage],
+      [async ({ inputData }) => inputData.intent === 'clarify', clarifyStage],
     ])
     // branch() emits { [stepId]: output }; flatten to the single staged reply.
-    .map(async ({ inputData }) => inputData[stepIds.plan] ?? inputData[stepIds.answer])
+    .map(
+      async ({ inputData }) =>
+        inputData[stepIds.plan] ??
+        inputData[stepIds.answer] ??
+        inputData[stepIds.direct] ??
+        inputData[stepIds.clarify]
+    )
     .branch([
       [shouldExecute, executePlan],
       [
@@ -750,9 +1207,7 @@ export function createDevTeamWorkflow(
         deliverAnswer,
       ],
     ])
-    .map(
-      async ({ inputData }) => inputData[stepIds.execute] ?? inputData[stepIds.deliver]
-    )
+    .map(async ({ inputData }) => inputData[stepIds.execute] ?? inputData[stepIds.deliver])
     .commit();
 }
 

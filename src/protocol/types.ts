@@ -19,7 +19,7 @@ import { z } from 'zod';
  * or field changes meaning - adding a new event type is backwards-compatible
  * and needs no bump.
  */
-export const PROTOCOL_VERSION = 3;
+export const PROTOCOL_VERSION = 5;
 
 /** One attached file/selection: a short label naming it plus its (already truncated) text. */
 export const AttachmentSchema = z.object({
@@ -44,17 +44,21 @@ export type ProjectInstructions = z.infer<typeof ProjectInstructionsSchema>;
 
 /**
  * One workspace skill the client discovered (a SKILL.md file under a configured
- * skills directory): the raw file text plus its workspace-relative path. The
- * client ships the raw text and the engine parses the frontmatter (name +
- * description) and body - a single parser, and the client must not reach into
- * the engine's config internals. A skill is a named, described block of
- * instructions the executor loads on demand (see RunRequest.skills).
+ * skills directory), as **metadata only**: its name, its one-line description,
+ * and its source path. The client parses the SKILL.md frontmatter and ships just
+ * this - the full body never rides on the request. The engine lists the name +
+ * description in the executor's prompt, and when the model loads a skill its
+ * `skill` tool fetches the body on demand from the client through the `tool`
+ * capability. Lazy by design: only a skill the model actually uses crosses the
+ * wire, and the engine bundles no skills of its own.
  */
 export const WorkspaceSkillSchema = z.object({
   /** The skill file's workspace-relative path, e.g. ".devteam/skills/demo/SKILL.md". */
   source: z.string(),
-  /** The raw SKILL.md text (frontmatter + body), already size-capped by the client. */
-  text: z.string(),
+  /** The skill's name (its frontmatter `name`), used to load its body on demand. */
+  name: z.string(),
+  /** The one-line description shown in the executor's "Available skills" catalogue. */
+  description: z.string(),
 });
 export type WorkspaceSkill = z.infer<typeof WorkspaceSkillSchema>;
 
@@ -126,11 +130,13 @@ export const RunRequestSchema = z.object({
   attachments: z.array(AttachmentSchema).optional(),
   history: z.array(HistoryTurnSchema).optional(),
   /**
-   * Workspace skills the client read from the configured skills directories
-   * (raw SKILL.md text). The engine merges them with its built-in skills and
-   * lists each skill's name + description to the executor, which loads a skill's
-   * full body on demand via its `skill` tool (progressive disclosure). Optional,
-   * so an engine that predates the field simply ignores it.
+   * Skill metadata (name + description + source) the client read from the
+   * configured skills directories. Only the metadata rides here; the engine
+   * lists each skill's name + description to the executor and its `skill` tool
+   * fetches a body on demand from the client (through the `tool` capability) when
+   * the model loads one (progressive disclosure, lazy over the wire - the engine
+   * bundles no skills of its own). Optional, so an engine that predates the field
+   * simply ignores it.
    */
   skills: z.array(WorkspaceSkillSchema).optional(),
   /**
@@ -200,8 +206,21 @@ export const ModelSelectionSchema = z.object({
 });
 export type ModelSelection = z.infer<typeof ModelSelectionSchema>;
 
-/** The routing decision: answer in one shot, or plan and execute. */
-export const IntentSchema = z.enum(['oneshot', 'planning']);
+/**
+ * The routing decision:
+ *  - "oneshot":  answer in one shot, no workspace change (the answerer).
+ *  - "planning": decompose into a plan, then execute it (planner -> executor).
+ *  - "direct":   a small, well-specified change that needs no plan - hand it
+ *                straight to the executor. Skips the planner (and its model
+ *                call); escalated to "planning" when the user asked to approve
+ *                every plan (`myDevTeam.planApproval` = "always").
+ *  - "clarify":  the request is too ambiguous to route well, so instead of
+ *                guessing the run ends by asking the user one or more questions
+ *                (each with predefined options and/or a free-form answer). A
+ *                terminal route - no plan, no execution; the user's reply on the
+ *                next turn carries the run forward. Gated by `myDevTeam.clarify.enabled`.
+ */
+export const IntentSchema = z.enum(['oneshot', 'planning', 'direct', 'clarify']);
 export type Intent = z.infer<typeof IntentSchema>;
 
 /**
@@ -209,8 +228,9 @@ export type Intent = z.infer<typeof IntentSchema>;
  * sizes the executor's model (see the model registry's `tier`): "simple" work
  * (a self-contained script) routes to a cheaper/smaller model, "complex" work
  * (multi-file changes, subtle debugging) to the strongest one. Only the
- * executor consumes it, and only on the planning route; a pinned model and the
- * `complexityRouting` opt-out both bypass it.
+ * executor consumes it, on the planning and direct routes (a direct change is
+ * always "simple"); a pinned model and the `complexityRouting` opt-out both
+ * bypass it.
  */
 export const ComplexitySchema = z.enum(['simple', 'moderate', 'complex']);
 export type Complexity = z.infer<typeof ComplexitySchema>;
@@ -270,6 +290,53 @@ export const PlanDecisionSchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('revise'), comment: z.string() }),
 ]);
 export type PlanDecision = z.infer<typeof PlanDecisionSchema>;
+
+/**
+ * What the executor tells the client at a periodic check-in (see
+ * RunClient.confirmContinue): how many tool-calling steps it has taken so far,
+ * how long the run has been going, and a short description of the last thing it
+ * did - enough for the user to decide whether the work should keep going. Plain,
+ * wire-serializable data.
+ */
+export interface CheckpointInfo {
+  /** Tool-calling steps taken so far across the whole execution. */
+  stepsDone: number;
+  /** Wall-clock seconds since execution began. */
+  secondsElapsed: number;
+  /** A short label of the most recent action (e.g. a tool name), when known. */
+  lastAction?: string;
+}
+
+/**
+ * A one-way notice (no answer) that a run's context is filling its model's
+ * window: emitted by the executor when usage first crosses a configured
+ * threshold (`myDevTeam.executor.contextWarnThresholds`). Plain, wire-
+ * serializable data the client renders as an inline caution.
+ */
+export interface ContextWarning {
+  /** The model whose window is filling (its display name). */
+  model: string;
+  /** The threshold percentage just crossed (e.g. 90). */
+  threshold: number;
+  /** The actual usage percentage at the time of the notice (>= threshold). */
+  percent: number;
+  /** Tokens currently in the model's context (provider-reported or estimated). */
+  usedTokens: number;
+  /** The model's context window in tokens (override or built-in). */
+  contextWindow: number;
+  /** True when `usedTokens` is a length-based estimate, not provider-reported. */
+  estimated: boolean;
+}
+
+/**
+ * The user's verdict at an executor check-in (see RunClient.confirmContinue):
+ * keep working, or stop now and summarize what has been gathered so far.
+ */
+export const ContinueDecisionSchema = z.discriminatedUnion('kind', [
+  z.object({ kind: z.literal('continue') }),
+  z.object({ kind: z.literal('stop') }),
+]);
+export type ContinueDecision = z.infer<typeof ContinueDecisionSchema>;
 
 /**
  * A snapshot of the plan while the engine is still drafting it. Field values
@@ -399,9 +466,43 @@ export type PartialSummary = {
 };
 
 /**
+ * One clarifying question the engine asks when it routes to "clarify": a prompt,
+ * a set of predefined answer options (the user picks one), and whether a
+ * free-form answer is also allowed. Plain, wire-serializable data the client
+ * renders as a question with numbered options (and, when `allowOther`, a note
+ * that the user may answer in their own words). The user's reply rides back as
+ * the next conversation turn, so no in-run answer channel is needed.
+ */
+export const ClarifyQuestionSchema = z.object({
+  question: z.string(),
+  /** Predefined answers offered as numbered choices; may be empty for a free-form-only ask. */
+  options: z.array(z.string()),
+  /** Whether the user may answer in their own words instead of picking an option. */
+  allowOther: z.boolean(),
+});
+export type ClarifyQuestion = z.infer<typeof ClarifyQuestionSchema>;
+
+/**
+ * The user's answer to one clarifying question the planner puts to them mid-run
+ * through its `clarify` tool (a client call over the `tool` capability). Unlike
+ * the "clarify" route - which ends the turn and waits for the next conversation
+ * turn - the client composes these answers into the tool's result string so the
+ * same planner loop continues in the one turn. `answer`
+ * is the option the user picked or the words they typed; `question` echoes the
+ * prompt it answers so their pairing cannot be confused. Plain, wire-
+ * serializable data.
+ */
+export const ClarifyAnswerSchema = z.object({
+  question: z.string(),
+  answer: z.string(),
+});
+export type ClarifyAnswer = z.infer<typeof ClarifyAnswerSchema>;
+
+/**
  * What a run produces: the routing decision plus, for "planning" requests,
- * the drafted plan and the execution transcript, or, for "oneshot" requests,
- * the direct answer. Rendering this into chat markdown is the client's job.
+ * the drafted plan and the execution transcript, for "oneshot" requests the
+ * direct answer, or, for "clarify" requests, the questions to put to the user.
+ * Rendering this into chat markdown is the client's job.
  */
 export const ReplySchema = z.object({
   intent: IntentSchema,
@@ -415,6 +516,8 @@ export const ReplySchema = z.object({
   execution: ExecutionSchema.optional(),
   /** The three-section recap of an executed plan; absent when nothing changed. */
   summary: SummarySchema.optional(),
+  /** The clarifying questions to ask; present only on the "clarify" route. */
+  questions: z.array(ClarifyQuestionSchema).optional(),
 });
 export type Reply = z.infer<typeof ReplySchema>;
 
@@ -434,4 +537,6 @@ export type ReplyProgress = {
   answer?: string;
   execution?: PartialExecution;
   summary?: PartialSummary;
+  /** The clarifying questions to ask; present only on the "clarify" route. */
+  questions?: ClarifyQuestion[];
 };

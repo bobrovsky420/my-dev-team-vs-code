@@ -10,6 +10,7 @@ beforeEach(() => {
   delete process.env.OPENAI_API_KEY;
   delete process.env.ANTHROPIC_API_KEY;
   delete process.env.GROQ_API_KEY;
+  delete process.env.DEEPSEEK_API_KEY;
   resetSecretSource();
 });
 
@@ -17,6 +18,7 @@ afterEach(() => {
   delete process.env.OPENAI_API_KEY;
   delete process.env.ANTHROPIC_API_KEY;
   delete process.env.GROQ_API_KEY;
+  delete process.env.DEEPSEEK_API_KEY;
   resetSecretSource();
 });
 

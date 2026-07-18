@@ -93,6 +93,19 @@ function fakeSummarizer(
   return (() => ({ summarize: impl })) as any;
 }
 
+// createDevTeamWorkflow takes a responder *factory* (optional - combined mode).
+// It returns a responder whose `respond` the combined step calls; the impl
+// returns the route + answer/plan in one go, the way the real responder does.
+function fakeResponder(
+  impl: (
+    prompt: string,
+    onPartial?: (progress: any) => void,
+    onUsage?: UsageReporter
+  ) => Promise<any>
+) {
+  return (() => ({ respond: impl })) as any;
+}
+
 const aSummary: SummaryResult = {
   whatShips: 'A feature',
   howItsBuilt: 'A small module',
@@ -866,6 +879,398 @@ describe('dev-team workflow plan approval', () => {
     if (result.status === 'success') {
       expect(result.result.plan).toEqual(complexPlan);
     }
+  });
+});
+
+describe('dev-team workflow combined mode', () => {
+  beforeEach(() => __reset());
+
+  // A workflow built with a responder factory runs in combined mode: the
+  // responder replaces triage + the answerer/planner on the unpinned path. The
+  // triage/planner/answerer fakes are still passed (a pinned command uses them),
+  // and counters track which actually ran.
+  function combined(
+    respond: (prompt: string, onPartial?: (p: any) => void) => Promise<any>
+  ) {
+    const state = { triage: 0, planner: 0, answerer: 0, executor: 0, responder: 0 };
+    const wf = createDevTeamWorkflow(
+      fakeTriage(async () => {
+        state.triage += 1;
+        return { intent: 'planning', complexity: 'moderate', reason: 'x' };
+      }),
+      fakePlanner(async () => {
+        state.planner += 1;
+        return aPlan;
+      }),
+      fakeAnswerer(async () => {
+        state.answerer += 1;
+        return 'pinned answer';
+      }),
+      fakeExecutor(async () => {
+        state.executor += 1;
+        return anExecution;
+      }),
+      undefined,
+      fakeResponder(async (p, onPartial) => {
+        state.responder += 1;
+        return respond(p, onPartial);
+      })
+    );
+    return { state, wf };
+  }
+
+  it('answers a oneshot in one responder call, never touching triage or the executor', async () => {
+    const { state, wf } = combined(async () => ({
+      intent: 'oneshot',
+      reason: 'just a question',
+      complexity: 'simple',
+      answer: 'a closure captures its scope',
+    }));
+    const run = await wf.createRun();
+    const result = await run.start({ inputData: { prompt: 'what is a closure' } });
+    expect(state.responder).toBe(1);
+    expect(state.triage).toBe(0);
+    expect(state.answerer).toBe(0);
+    expect(state.executor).toBe(0);
+    expect(result.status).toBe('success');
+    if (result.status === 'success') {
+      expect(result.result.intent).toBe('oneshot');
+      expect(result.result.answer).toBe('a closure captures its scope');
+    }
+  });
+
+  it('drafts a plan in one responder call and executes it', async () => {
+    // The real responder builds a plan carrying its complexity; mirror that.
+    const responderPlan: PlanResult = { ...aPlan, complexity: 'moderate' };
+    const { state, wf } = combined(async () => ({
+      intent: 'planning',
+      reason: 'needs a change',
+      complexity: 'moderate',
+      plan: responderPlan,
+    }));
+    const run = await wf.createRun();
+    const result = await run.start({ inputData: { prompt: 'refactor the module' } });
+    expect(state.responder).toBe(1);
+    expect(state.triage).toBe(0);
+    expect(state.planner).toBe(0);
+    expect(state.executor).toBe(1);
+    expect(result.status).toBe('success');
+    if (result.status === 'success') {
+      expect(result.result.intent).toBe('planning');
+      expect(result.result.plan).toEqual(responderPlan);
+      expect(result.result.execution).toEqual(anExecution);
+    }
+  });
+
+  it('hands the responder the full prompt with attachment text', async () => {
+    let seen = '';
+    const { wf } = combined(async (p) => {
+      seen = p;
+      return { intent: 'oneshot', reason: 'r', complexity: 'simple', answer: 'ok' };
+    });
+    const run = await wf.createRun();
+    await run.start({
+      inputData: {
+        prompt: 'explain this',
+        attachments: [{ label: 'File: src/a.ts', text: 'file body' }],
+      },
+    });
+    expect(seen).toContain('explain this');
+    expect(seen).toContain('--- Attached context ---');
+    expect(seen).toContain('file body');
+  });
+
+  it('gates a complex plan from the responder and delivers plan-only on cancel', async () => {
+    const complexPlan: PlanResult = {
+      summary: 'A big change',
+      steps: [{ title: 'Do it', detail: 'carefully' }],
+      complexity: 'complex',
+    };
+    const { state, wf } = combined(async () => ({
+      intent: 'planning',
+      reason: 'big',
+      complexity: 'complex',
+      plan: complexPlan,
+    }));
+    const requestContext = new RequestContext();
+    requestContext.set(planReviewKey, async () => ({ kind: 'cancel' }) as PlanDecision);
+    const run = await wf.createRun();
+    const result = await run.start({
+      inputData: { prompt: 'do the big thing' },
+      requestContext,
+    });
+    expect(state.executor).toBe(0);
+    expect(result.status).toBe('success');
+    if (result.status === 'success') {
+      expect(result.result.plan).toEqual(complexPlan);
+      expect(result.result.execution).toBeUndefined();
+    }
+  });
+
+  it('lets a slash command pin the route and use the dedicated agents, not the responder', async () => {
+    // /plan pins planning and stops after drafting; in combined mode it must
+    // still go through the dedicated planner, leaving the responder unused.
+    const { state, wf } = combined(async () => {
+      throw new Error('responder must not run for a pinned command');
+    });
+    const run = await wf.createRun();
+    const result = await run.start({ inputData: { prompt: 'plan it', command: 'plan' } });
+    expect(state.responder).toBe(0);
+    expect(state.planner).toBe(1);
+    expect(state.executor).toBe(0);
+    expect(result.status).toBe('success');
+    if (result.status === 'success') {
+      expect(result.result.plan).toEqual(aPlan);
+    }
+  });
+});
+
+describe('dev-team workflow direct route', () => {
+  beforeEach(() => __reset());
+
+  // Build a workflow whose triage returns the given intent; counters track which
+  // agents ran. The executor records the prompt it was briefed with.
+  function routed(intent: Intent, opts: { combined?: boolean } = {}) {
+    const state = { planner: 0, executor: 0, responder: 0, executorPrompt: '' };
+    const triage = fakeTriage(async () => ({ intent, complexity: 'simple', reason: 'tiny' }));
+    const planner = fakePlanner(async () => {
+      state.planner += 1;
+      return aPlan;
+    });
+    const executor = fakeExecutor(async (p) => {
+      state.executor += 1;
+      state.executorPrompt = p;
+      return anExecution;
+    });
+    const responder = fakeResponder(async () => {
+      state.responder += 1;
+      return { intent, reason: 'tiny', complexity: 'simple' };
+    });
+    const wf = createDevTeamWorkflow(
+      triage,
+      planner,
+      fakeAnswerer(),
+      executor,
+      undefined,
+      opts.combined ? responder : undefined
+    );
+    return { state, wf };
+  }
+
+  it('classifier mode: a direct change skips the planner and executes with no plan', async () => {
+    const { state, wf } = routed('direct');
+    const run = await wf.createRun();
+    const result = await run.start({ inputData: { prompt: 'bump the timeout to 60' } });
+    expect(state.planner).toBe(0);
+    expect(state.executor).toBe(1);
+    // The executor was briefed without a plan section, with the direct-task note.
+    expect(state.executorPrompt).toContain('--- Task ---');
+    expect(state.executorPrompt).not.toContain('--- Drafted plan ---');
+    expect(result.status).toBe('success');
+    if (result.status === 'success') {
+      expect(result.result.intent).toBe('direct');
+      expect(result.result.plan).toBeUndefined();
+      expect(result.result.execution).toEqual(anExecution);
+    }
+  });
+
+  it('combined mode: a direct decision from the responder executes with no plan', async () => {
+    const { state, wf } = routed('direct', { combined: true });
+    const run = await wf.createRun();
+    const result = await run.start({ inputData: { prompt: 'rename tmp to buffer' } });
+    expect(state.responder).toBe(1);
+    expect(state.planner).toBe(0);
+    expect(state.executor).toBe(1);
+    expect(result.status).toBe('success');
+    if (result.status === 'success') {
+      expect(result.result.intent).toBe('direct');
+      expect(result.result.plan).toBeUndefined();
+      expect(result.result.execution).toEqual(anExecution);
+    }
+  });
+
+  it('escalates a direct change to planning when planApproval is "always" (with a review seam)', async () => {
+    __setConfig('myDevTeam.planApproval', 'always');
+    const { state, wf } = routed('direct');
+    const requestContext = new RequestContext();
+    const reviews: number[] = [];
+    requestContext.set(planReviewKey, async () => {
+      reviews.push(1);
+      return { kind: 'approve' } as PlanDecision;
+    });
+    const run = await wf.createRun();
+    const result = await run.start({
+      inputData: { prompt: 'rename tmp to buffer' },
+      requestContext,
+    });
+    // Escalated: a plan was drafted, gated (approved), then executed.
+    expect(state.planner).toBe(1);
+    expect(reviews).toHaveLength(1);
+    expect(state.executor).toBe(1);
+    expect(result.status).toBe('success');
+    if (result.status === 'success') {
+      expect(result.result.intent).toBe('planning');
+      expect(result.result.plan).toEqual(aPlan);
+    }
+  });
+
+  it('does not escalate a direct change when there is no review seam, even on "always"', async () => {
+    __setConfig('myDevTeam.planApproval', 'always');
+    const { state, wf } = routed('direct');
+    const run = await wf.createRun(); // no planReview seam wired
+    const result = await run.start({ inputData: { prompt: 'add a gitignore entry' } });
+    expect(state.planner).toBe(0);
+    expect(state.executor).toBe(1);
+    if (result.status === 'success') {
+      expect(result.result.intent).toBe('direct');
+    }
+  });
+});
+
+describe('dev-team workflow clarify route', () => {
+  beforeEach(() => __reset());
+
+  const aQuestion = {
+    question: 'Which database do you mean?',
+    options: ['Postgres', 'SQLite'],
+    allowOther: true,
+  };
+
+  it('classifier mode: a clarify decision ends the run with the questions and no work agent', async () => {
+    let answererCalled = false;
+    let plannerCalled = false;
+    let executorCalled = false;
+    const wf = createDevTeamWorkflow(
+      fakeTriage(async () => ({ intent: 'clarify', reason: 'ambiguous', questions: [aQuestion] })),
+      fakePlanner(async () => {
+        plannerCalled = true;
+        return aPlan;
+      }),
+      fakeAnswerer(async () => {
+        answererCalled = true;
+        return 'unused';
+      }),
+      fakeExecutor(async () => {
+        executorCalled = true;
+        return anExecution;
+      })
+    );
+    const run = await wf.createRun();
+    const result = await run.start({ inputData: { prompt: 'migrate the database' } });
+    expect(result.status).toBe('success');
+    if (result.status === 'success') {
+      expect(result.result.intent).toBe('clarify');
+      expect(result.result.questions).toEqual([aQuestion]);
+      expect(result.result.plan).toBeUndefined();
+      expect(result.result.execution).toBeUndefined();
+      expect(result.result.answer).toBeUndefined();
+    }
+    expect(answererCalled).toBe(false);
+    expect(plannerCalled).toBe(false);
+    expect(executorCalled).toBe(false);
+  });
+
+  it('coerces clarify to a normal answer when myDevTeam.clarify.enabled is off', async () => {
+    __setConfig('myDevTeam.clarify.enabled', false);
+    let answererCalled = false;
+    const wf = createDevTeamWorkflow(
+      fakeTriage(async () => ({ intent: 'clarify', reason: 'ambiguous', questions: [aQuestion] })),
+      fakePlanner(async () => aPlan),
+      fakeAnswerer(async () => {
+        answererCalled = true;
+        return 'A reasonable answer.';
+      }),
+      fakeExecutor()
+    );
+    const run = await wf.createRun();
+    const result = await run.start({ inputData: { prompt: 'migrate the database' } });
+    expect(result.status).toBe('success');
+    if (result.status === 'success') {
+      expect(result.result.intent).toBe('oneshot');
+      expect(result.result.answer).toBe('A reasonable answer.');
+      expect(result.result.questions).toBeUndefined();
+    }
+    expect(answererCalled).toBe(true);
+  });
+
+  it('coerces clarify to a normal answer when the model produced no usable question', async () => {
+    let answererCalled = false;
+    const wf = createDevTeamWorkflow(
+      // intent clarify but an empty question list (or all blank) - nothing to ask.
+      fakeTriage(async () => ({ intent: 'clarify', reason: 'ambiguous', questions: [] })),
+      fakePlanner(async () => aPlan),
+      fakeAnswerer(async () => {
+        answererCalled = true;
+        return 'A reasonable answer.';
+      }),
+      fakeExecutor()
+    );
+    const run = await wf.createRun();
+    const result = await run.start({ inputData: { prompt: 'do the thing' } });
+    if (result.status === 'success') {
+      expect(result.result.intent).toBe('oneshot');
+      expect(result.result.answer).toBe('A reasonable answer.');
+    }
+    expect(answererCalled).toBe(true);
+  });
+
+  it('combined mode: a clarify decision from the responder ends with the questions', async () => {
+    let answererCalled = false;
+    const responder = fakeResponder(async () => ({
+      intent: 'clarify',
+      reason: 'ambiguous',
+      complexity: 'simple',
+      questions: [aQuestion],
+    }));
+    const wf = createDevTeamWorkflow(
+      fakeTriage(async () => ({ intent: 'oneshot', reason: 'unused' })),
+      fakePlanner(async () => aPlan),
+      fakeAnswerer(async () => {
+        answererCalled = true;
+        return 'unused';
+      }),
+      fakeExecutor(),
+      undefined,
+      responder
+    );
+    const run = await wf.createRun();
+    const result = await run.start({ inputData: { prompt: 'migrate the database' } });
+    expect(result.status).toBe('success');
+    if (result.status === 'success') {
+      expect(result.result.intent).toBe('clarify');
+      expect(result.result.questions).toEqual([aQuestion]);
+    }
+    expect(answererCalled).toBe(false);
+  });
+
+  it('combined mode: falls back to the answerer when clarify is off', async () => {
+    __setConfig('myDevTeam.clarify.enabled', false);
+    let answererCalled = false;
+    const responder = fakeResponder(async () => ({
+      intent: 'clarify',
+      reason: 'ambiguous',
+      complexity: 'simple',
+      questions: [aQuestion],
+    }));
+    const wf = createDevTeamWorkflow(
+      fakeTriage(async () => ({ intent: 'oneshot', reason: 'unused' })),
+      fakePlanner(async () => aPlan),
+      fakeAnswerer(async () => {
+        answererCalled = true;
+        return 'A reasonable answer.';
+      }),
+      fakeExecutor(),
+      undefined,
+      responder
+    );
+    const run = await wf.createRun();
+    const result = await run.start({ inputData: { prompt: 'migrate the database' } });
+    if (result.status === 'success') {
+      expect(result.result.intent).toBe('oneshot');
+      expect(result.result.answer).toBe('A reasonable answer.');
+      expect(result.result.questions).toBeUndefined();
+    }
+    expect(answererCalled).toBe(true);
   });
 });
 

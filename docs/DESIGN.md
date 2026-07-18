@@ -59,77 +59,92 @@ src/
   protocol/               the engine/client contract: wire-shaped, zod-validated, version-stamped
     types.ts              run request + reply data shapes and their streaming snapshots
     events.ts             the run event stream + ReplyFolder (folds events back into snapshots)
-    toolContract.ts       client tool names, input schemas, lm ids, display names + the ToolHost seam
-    engine.ts             the Engine port, RunClient/RunHandle, AuthProvider, run error types
+    toolContract.ts       client tool names, input schemas, lm ids, display names + the ToolHost seam (the tool slice of the inversion)
+    capabilities.ts       the one engine->client inversion: CapabilityMap + ClientHost.invoke, makeClientHost (client side), hostFacade (engine side)
+    engine.ts             the Engine port, RunClient (= onEvent + ClientHost)/RunHandle, AuthProvider, run error types
   engine/                 the implementation a future backend hides - nothing above may import its internals
     localEngine.ts        in-process Engine: runs the workflow, translates progress into protocol events
     core/
       workflow.ts         Mastra workflow: triage -> plan -> (approval gate) -> execute | answer; per-run progress, usage + thinking sinks
-      models.ts           provider wiring (ollama/llamacpp/openai/anthropic/groq): availability + pin-aware routing into an AI SDK model
+      models.ts           provider wiring (ollama/llamacpp/openai/anthropic/groq/deepseek/zai): availability + pin-aware routing into an AI SDK model
       rateLimiter.ts      per-provider request throttle (RPM) + 429 retry-after-delay, as an AI SDK model middleware
-      triage.ts           Mastra agent: triage request as oneshot | planning
-      planner.ts          Mastra agent: draft an ordered plan of titled steps + a complexity judgement, streamed as partial snapshots; model sized by triage's complexity
+      providerLog.ts      debug-logging middleware: traces each provider call's raw request + response to the debug sink when myDevTeam.debug is on (a pass-through otherwise)
+      triage.ts           Mastra agent: triage request as oneshot | planning | direct | clarify
+      responder.ts        Mastra agent (combined mode, myDevTeam.triage.mode=combined): triage + answer/plan in one call; either streams an answer or drafts a plan, replacing triage + answerer/planner on the unpinned path
+      clarify.ts          the clarify route's shared material: the question generation schema, the "ask sparingly" guidance, and the wire-shape normaliser (triage + responder)
+      planner.ts          Mastra agent: explore (read/search) and optionally ask (clarify) in a tool-calling loop, then draft an ordered plan of titled steps + a complexity judgement as structured output, streamed as partial snapshots; same batched check-ins/ceiling as the executor; model sized by triage's complexity
       answerer.ts         Mastra agent: answer a oneshot request directly, streamed as accumulated text (+ reasoning split out as thinking)
-      executor.ts         Mastra agent: walk the plan in a tool-calling loop, streamed as a transcript (+ reasoning split out as thinking)
+      executor.ts         Mastra agent: walk the plan in a tool-calling loop (batched, with periodic continue/stop check-ins), streamed as a transcript (+ reasoning split out as thinking)
+      toolLoop.ts         the batched tool-calling loop shared by the executor and the planner: step-cap batching to the maxSteps ceiling, periodic continue/stop check-ins, the tools-off wrap-up turn, usage accumulation, and context-window warnings
       summarizer.ts       Mastra agent: recap an executed, file-changing run in three sections, streamed as snapshots
+      compacter.ts        Mastra agent: condense the whole conversation into a briefing that replaces it (/compact); prefers a big-window model, history trimmed to that window
       repair.ts           bounded self-repair for structured output: re-ask on a schema-validation failure
-      agentTools.ts       the executor's tool proxies: every call delegates to the client's ToolHost
+      agentTools.ts       the executor's tool proxies + the planner's read/search proxies and engine-built clarify tool: every host call delegates through the engine-side hostFacade (a ToolHost over the client's single `invoke`); clarify/skill ride the same seam
       thinking.ts         condense a reasoning model's <think> output to its latest line for the (ephemeral) thinking signal
       usage.ts            token-count extraction (SDK counts, else a length-based estimate) feeding the usage (billing) events
     config/
       agents/*.md         one agent per file: frontmatter + system prompt
-      models/*.md         one registered model per file: provider, model id, capability scores
+      models/*.md         one registered model per file: provider, model id, capability scores (GENERATED from the shared my-dev-team-config registry)
       tools/*.md          model-facing tool descriptions + transcript preview hints
       commands/*.md       one slash command per file: pinned route, execute flag + prompt preamble
-      skills/*.md         one built-in skill per file: name + description frontmatter + instruction body
+      partials/*.md       shared prompt blocks (e.g. the untrusted-data guard), embedded by `{{ include <name> }}`; GENERATED from the my-dev-team-config repo
       backend.ts          loads + validates the root config/backend.json (below), exports the typed `backendConfig`
-      agents.ts           loads agents/*.md, renders the tools + environment sections, exports `agents`
+      agents.ts           loads agents/*.md, resolves `{{ include }}` partials, renders the tools + environment sections, exports `agents`
+      partials.ts         discovers partials/*.md, exports the registry + `resolveIncludes`
       models.ts           discovers models/*.md, exports the registry + capability-based `selectModel`
+      steering.ts         derives a per-model "Model-specific guidance" prompt section from the routed model's capability scores (`withSteering`)
       tools.ts            discovers tools/*.md, exports `toolConfigs` + `renderToolsSection`
       commands.ts         discovers commands/*.md, exports `commandConfigs` (route pinning + preambles)
-      skills.ts           discovers skills/*.md, merges them with workspace skills (`resolveSkills`) + renders the executor's catalogue
-      frontmatter.ts      minimal frontmatter parser for the .md config files
+      skills.ts           de-duplicates the run's skill metadata into the executor's catalogue (`resolveSkills`) + renders it; the engine bundles no skills and holds no bodies
+      frontmatter.ts      re-export of the shared `config/frontmatter.ts` parser (kept so engine config loaders import `./frontmatter` unchanged)
       markdown.d.ts       lets TS treat `*.md` and `glob:` imports as strings / string[]
   client/
     engineFactory.ts      the myDevTeam.engine switch: LocalEngine, the sidecar child, or RemoteEngine (Phase B); respawns a crashed child (gives up after repeated crashes), disposes the sidecar
-    sidecarEngine.ts      client end of the sidecar: an Engine that forks the child (createForkedChannel) or a stream (createStreamChannel/NDJSON), holds runs until the ready handshake, times out queries, folds events back, services tool-call/plan-review
+    sidecarEngine.ts      client end of the sidecar: an Engine that forks the child (createForkedChannel) or a stream (createStreamChannel/NDJSON), holds runs until the ready handshake, times out queries, folds events back, services every `invoke` through the real client
     secrets.ts            the host's SecretStorage-backed secret source (+ the Set API Key cache), injected into config/credentials for the local engine
     auth.ts               AuthProvider implementations (anonymous today; real credentials in Phase B)
     instructions.ts       reads the workspace's AGENTS.md/CLAUDE.md as standing project instructions per request
-    skills.ts             discovers SKILL.md files per request (workspace roots + home dir), ships their raw text on the run request
+    skills.ts             discovers SKILL.md files per request (workspace roots + home dir), parses their frontmatter, ships only the metadata (name + description) and keeps the bodies to serve on demand when the model's `skill` tool asks (via the `tool` capability)
     mcp.ts                McpHub: launches the configured stdio MCP servers, discovers + namespaces their tools, runs a call back through the ToolHost (trust-gated, disposed on deactivate)
-    references.ts         resolves a request's references into attachments: files/selections/symbols + inline #codebase/#changes
+    references.ts         resolves a request's references into attachments: files/selections/symbols + inline #codebase/#changes + the auto-attached active editor
     evalLog.ts            opt-in local JSONL eval store: per-run route/usage/outcome records + 👍/👎 feedback; reads them back for the usage report
     usageStats.ts         pure token-usage aggregation: roll the log up by step/model/route/day + input-by-source + a feedback-cost join, derive cache/estimate ratios
     changeTracker.ts      per-turn change collector: write/edit report each landed file, rolled up into the reply's "N files changed, +X -Y" line
+    debugLog.ts           the client end of myDevTeam.debug: the "My Dev Team (Debug)" output channel writer (DebugChannel) + traceEngine, an Engine decorator that logs the client<->backend protocol
+    serialQueue.ts        per-run FIFO queue the handler wraps the ToolHost with, so a model step's concurrently-fired tool calls run one at a time, in call order
   config/                 configuration, kept out of the logic (see below)
+    frontmatter.ts        the shared `.md` frontmatter parser (vscode-free): used by the engine's config loaders and by the client's SKILL.md reader, so both halves agree on what a skill is called
     providers.ts          the single provider registry: one descriptor per provider (id, label, keyless, env-var key, base-URL setting, build factory) - everything provider-specific derives from this
     settings.ts           the vscode-backed user settings (read live); builds the engine's runtime-config view (client only)
     limits.ts             vscode-free compile-time constants the engine reads (executor/retry/skills caps, ...); settings.ts re-exposes them
     uiLimits.ts           compile-time constants the client reads (plan-preview "big" thresholds, MCP-args approval-preview cap, status-bar priority); the client-side analog of limits.ts
     runtimeConfig.ts      vscode-free injected seam: the user settings the engine reads, set by the host (live view) or the sidecar child (snapshot)
     credentials.ts        cloud-provider API keys behind an injectable source (vscode-free): default env-only (the sidecar's only source); the host injects a SecretStorage source for the local engine
+    debugLog.ts           vscode-free debug-logging seam: an injectable DebugSink + emitDebug, the engine's provider-API traffic routed to the host's output channel (local) or over the wire (sidecar) when myDevTeam.debug is on
     messages.ts           user-facing chat copy (errors, warnings, templates, the model-selection copy)
     environment.ts        runtime OS/shell facts: fills prompt placeholders, picks the run tool's shell
     clientCommands.ts     the client-handled /clear and /model commands + the /compact history-replacement and /ask side-question markers
   sidecar/                the engine-as-a-child-process plumbing (vscode-free)
-    transport.ts          the sidecar wire: parent<->child message types (incl. the ready handshake) + the SidecarChannel seam
-    childRuntime.ts       hosts an Engine and maps messages to engine calls; posts the ready handshake; the tool-call/plan-review proxies that invert side effects back to the parent
+    transport.ts          the sidecar wire: parent<->child message types (incl. the ready handshake + the child's debug-log forwarding) + the SidecarChannel seam
+    childRuntime.ts       hosts an Engine and maps messages to engine calls; posts the ready handshake; the tool-call/plan-review/continue-review proxies that invert side effects back to the parent
     main.ts               the child entry point: wires childRuntime to process IPC + a real LocalEngine; bundled to dist/sidecar.js, never imports vscode
+    ndjson.ts             NDJSON framing (one JSON message per line) for the stdio child: chunk reassembly, malformed lines skipped; vscode- and Node-free
+    stdioMain.ts          the stdio child entry point for non-Node clients (the IntelliJ plugin): same childRuntime + LocalEngine over stdin/stdout NDJSON, console routed to stderr; bundled to dist/sidecar-stdio.js
   tools/                  the client's hands - these never move to a backend
     workspaceTools.ts     read / search / run / write / edit implementations (UI-agnostic)
     contentSearch.ts      content search: bundled ripgrep (fast path) with a JS extension-host scan fallback
+    commandPolicy.ts      the run gate's allowlist (skip the prompt) + denylist (always prompt as destructive) + "always allow" persistence
     diff.ts               tiny LCS line-diff: git-style added/removed counts for the change summary
-    toolHost.ts           WorkspaceToolHost: validates + dispatches every tool call (engine or editor)
-    registerTools.ts      registers the tools with vscode.lm, delegating to the same host
+    toolHost.ts           WorkspaceToolHost: validates + dispatches every tool call (the `tool` capability of the run's ClientHost); private to @devteam, not registered editor-wide
     types.ts              the client seams: Approver (approval) + RunMirror (run transparency) + ChangeReporter (change tracking)
   ui/
-    chatParticipant.ts    chat handler: folds run events, streams the reply + Phase-1 ChatApprover + ChatPlanReviewer (plan-approval gate)
+    chatParticipant.ts    chat handler: folds run events, streams the reply + Phase-1 ChatApprover + ChatPlanReviewer (plan-approval gate) + ChatContinuePrompt (executor check-in)
     planPreview.ts        read-only editor preview of a big paused plan: a virtual-document content provider opened beside the chat for review (myDevTeam.planApproval.preview)
     quickQuestion.ts      the quick-question command (hotkey): an input box runs a side question as the pinned /ask route (no history, no tools), the answer streams into a read-only editor preview
     modelCommands.ts      model selection UI: the grouped /model picker (a provider/Auto pick sets the work model + triage at once; an advanced group sets triage alone) and the Set API Key command (SecretStorage; used by the local engine)
     verbosityCommands.ts  output-verbosity UI: the /verbose chat command and the "Select Output Mode" picker, writing the myDevTeam.verbosity rendering setting (client-only; the engine never sees it)
-    statusBar.ts          the single "My Dev Team" status-bar button: a rich hover (trusted markdown with command links) and a click menu to change the model, output mode, or open the usage report; holds the live model label and session token total
+    triageModeCommands.ts request-routing UI: the "Select Routing Mode" picker, writing the myDevTeam.triage.mode setting (the engine reads it live and routes accordingly - not a pure rendering choice like verbosity)
+    statusBar.ts          the single "My Dev Team" status-bar button: a rich hover (trusted markdown with command links) and a click menu to change the model, routing mode, or output mode, or open the usage report; holds the live model label and session token total
     usageView.ts          the "Show Token Usage" command: rolls the eval log up into a markdown report
     runTerminal.ts        Phase-1 RunMirror: a read-only "Dev Team" terminal logging every run command live
     editorEntryPoints.ts  editor shims: "Fix with Dev Team" code action, "Explain" selection action, write/repair-tests CodeLens - each opens the chat with a pinned command
@@ -238,13 +253,15 @@ engine/core/workflow.ts        Mastra workflow (createWorkflow + createStep)
         │                         local model's context; the history stays in
         │                         because a follow-up cannot be routed
         │                         without the conversation it follows)
-        │                         → { intent: "oneshot" | "planning",
+        │                         → { intent: "oneshot" | "direct" | "planning",
         │                            complexity: "simple" | "moderate" | "complex",
         │                            reason }
         │                         (complexity sizes the *planner's* model - see
         │                         Complexity routing; model picked by the
         │                         capability router; a known slash command pins
-        ▼                         intent + complexity without the model call)
+        │                         intent + complexity without the model call. A
+        │                         "direct" route is escalated to "planning" when
+        ▼                         planApproval = "always" and a review seam exists)
       branch
         ├─▶ draft-plan         ── Planner.plan(fullPrompt, onPartial)  (intent = "planning")
         │                         project instructions + conversation + prompt
@@ -257,6 +274,9 @@ engine/core/workflow.ts        Mastra workflow (createWorkflow + createStep)
         │                         setting + the plan's complexity ask for it, calls
         │                         the client's reviewPlan (approve | cancel |
         │                         revise-and-re-plan); cancel carries proceed=false
+        ├─▶ stage-direct       ── pass-through (intent = "direct"): no planner, no
+        │                         gate - a small, well-specified change goes
+        │                         straight to execute with no plan
         └─▶ answer-directly    ── Answerer.answer(fullPrompt, onPartial)  (intent = "oneshot")
         │                         → markdown answer (capability-routed model);
         │                         pushes the triage decision and the growing
@@ -264,14 +284,17 @@ engine/core/workflow.ts        Mastra workflow (createWorkflow + createStep)
         ▼
       branch
         ├─▶ execute-plan       ── Executor.execute(executionPrompt, onPartial)
-        │                         (a plan was drafted, not /plan, and not cancelled
-        │                         at the gate)
+        │                         (a plan was drafted, or the direct route; not
+        │                         /plan, and not cancelled at the gate)
         │                         project instructions + conversation + prompt
-        │                         + attachment text + the numbered plan;
+        │                         + attachment text + the numbered plan (or, on the
+        │                         direct route, a "carry out the request directly"
+        │                         note in place of the plan);
         │                         Mastra runs the tool-calling loop over the five
         │                         workspace tools (run Approver-gated);
         │                         → { events[] } transcript (model sized by the
-        │                         *planner's* complexity);
+        │                         planner's complexity, or triage's on the direct
+        │                         route);
         │                         pushes every transcript snapshot to the sink
         └─▶ deliver-answer     ── pass-through for the oneshot and plan-only paths
         │                         (a /plan run, or a plan cancelled at the gate)
@@ -288,6 +311,49 @@ so the workflow's output is just the reply - which is the protocol's
 `ReplySchema`, so the engine cannot produce a result the contract does not
 describe.
 
+**Combined mode (`myDevTeam.triage.mode` = `combined`).** When the setting is
+`combined` (and the engine wired a responder), the triage step and the
+draft-plan/answer-directly branch collapse into a single `respond` step
+(`engine/core/responder.ts`): one model call on the **work** model reads the
+request and emits `{ intent: "oneshot", answer }`,
+`{ intent: "planning", summary, steps[], complexity }`,
+`{ intent: "direct" }` (route only - a small change handed straight to the
+executor), or `{ intent: "clarify", questions[] }` (the ambiguous-request route,
+below); a discriminated structured output, validated/repaired like the
+planner's. It streams the same
+`triaged` + `answer-delta`/`plan-snapshot` events the classic path does, so the
+protocol and the client are unchanged. The `respond` step yields a
+`StagedReplySchema` directly, so the execute-vs-deliver branch is the same. The
+plan-approval gate is shared with the classic draft-plan step (the `gatePlan`
+helper); a revision re-drafts with the dedicated planner. Because the same call
+both routes and produces the work, the responder's own model is **not**
+complexity-sized (it decides complexity in the same breath); the executor it
+hands a plan to still is. A `direct` decision behaves like the classic direct
+route - straight to the executor with no plan, escalated to a drafted plan when
+`planApproval` = `always` and a review seam exists. A **slash command** still
+pins the route and runs the dedicated planner/answerer inside the `respond`
+step, so `/plan` stays plan-only and `/fix` keeps its complexity - only the
+unpinned path uses the responder.
+
+**The clarify route (`{ intent: "clarify" }`).** When a request is genuinely too
+ambiguous to route well, both triage (classic mode) and the responder (combined
+mode) may decide to **ask** rather than guess, carrying one or two
+`ClarifyQuestion`s (a prompt, predefined options, and an `allowOther` flag,
+shaped by `engine/core/clarify.ts`). It is a **terminal** route: a pass-through
+`stage-clarify` step (classic) or the `respond` step (combined) surfaces the
+questions and the run ends at `deliver-answer` with no plan and no execution -
+the user's reply on the next turn carries the work forward through the normal
+conversation history, so no in-run answer channel is needed. The
+`myDevTeam.clarify.enabled` setting (on by default) gates it: when off, or when
+the model produced no usable question, the decision is **coerced** back to a
+normal answer (triage swaps the route to `oneshot`; the responder, which cannot
+answer and ask in one call, makes a fresh answerer call), so a run always
+produces work rather than dead-ending. The asking bar is deliberately high (see
+`CLARIFY_GUIDANCE`): ask only about something the user alone can decide and that
+cannot be resolved from the request or a sensible default. The client renders the
+questions as a numbered list and additionally offers each suggested answer as a
+clickable chat follow-up.
+
 ### The engine protocol (`src/protocol/`)
 
 Everything the extension knows about the agent pipeline goes through one
@@ -296,53 +362,85 @@ without the client changing:
 
 - **`Engine.startRun(request, client)`** takes a versioned `RunRequest`
   (prompt, the user's `model` choice, project instructions, attachments,
-  history, the workspace's skills (raw `SKILL.md` text), the client's OS/shell
+  history, the workspace's skill metadata (name + description; bodies load on
+  demand), the client's OS/shell
   facts, and the names of the tools the client
-  offers) plus a `RunClient` (an event sink and the ToolHost) and returns a
-  `RunHandle` (`result` promise + `cancel()`). The `RunClient` also carries an
-  optional **`reviewPlan(plan, complexity)`** seam: the engine calls it at the
-  plan-approval gate and the client returns approve / cancel / revise (the same
-  trust split as the ToolHost - the gate UI lives entirely on the client; absent
-  the seam, the run never gates). **`Engine.listModels()`**
+  offers) plus a `RunClient` (an event sink `onEvent` plus a **`ClientHost`**)
+  and returns a `RunHandle` (`result` promise + `cancel()`).
+- **One inversion seam (`ClientHost.invoke`).** Every engine->client request -
+  not just running a tool - crosses one method: `invoke(capability, payload,
+  signal?, correlationId?)`, named by a `CapabilityName` and carrying plain,
+  wire-serializable data (`protocol/capabilities.ts`). There are three
+  capabilities. `tool` is everything the *model* calls and returns the text it
+  sees: the workspace tools (read/search/run/write/edit), MCP tools, and the two
+  engine-built model tools `clarify` (ask the user a focused question or two
+  mid-draft) and `skill` (load a skill's body by name, so an unused skill's body
+  never crosses the wire) - all dispatched by the tool name in the payload, all
+  "args in, text out", so they share one capability (the client composes the
+  model-facing result string for `clarify`/`skill`). The other two are the ones
+  the *workflow* triggers, returning structured decisions: `reviewPlan` (the
+  plan-approval gate: approve / cancel / revise) and `confirmContinue` (the
+  executor *and planner* check-in: continue / stop). `ClientHost.capabilities`
+  lists what this client implements, and the engine degrades anything absent - no
+  plan gate, no check-in - while a model tool degrades through the run's offered
+  tools (no `clarify` offered => the planner cannot ask; a `skill` the client
+  cannot serve => a "no such skill" notice). So each is purely additive, the same
+  trust split the ToolHost always had (the UI lives entirely on the client; the
+  engine only ever asks). The static per-capability types are recovered on top of
+  the one generic seam by a typed facade: `makeClientHost(handlers)` builds the
+  host from typed handlers on the client side, and `hostFacade(host)` gives the
+  engine typed `reviewPlan(...)` / `confirmContinue(...)` / a `ToolHost`
+  `execute(...)` over it - so a new capability never needs a new method, event, or
+  wire message. **`Engine.listModels()`**
   returns the picker's catalogue (Auto first, then each registered model with
   its label and whether it can run now) - the one place the otherwise-hidden
   model registry is exposed, as user-facing choices.
-- **Events, not callbacks**, carry the streaming reply: `triaged` (intent plus
-  the request's `complexity`),
+- **Events, not callbacks**, carry the streaming reply, one way: `triaged`
+  (intent plus the request's `complexity`),
   `model-selected` (which model each step uses; emitted right after `triaged`),
   `plan-snapshot` (plans are small), `answer-delta`, `execution-event`
   (indexed, since only the transcript's last event ever changes), `usage`,
   `triage-shadow` (what triage would have decided on a pinned run, only when
   the request asked for it - a non-rendering metering signal), `thinking` (a
-  condensed line of the model's reasoning), `plan-review` (a remote engine's
-  wire form of the approval gate, answered with a `PlanDecision`; the LocalEngine
-  calls the client's `reviewPlan` in-process instead, exactly as it calls the
-  ToolHost directly rather than emitting `tool-call`), and
-  `done`/`error`. The client folds them back into grow-only snapshots
+  condensed line of the model's reasoning), `context-warning` (a one-way
+  caution, emitted once per crossed threshold, that the run is filling the
+  model's context window), and
+  `done`/`error`. Events are a pure one-way stream and are never answered: the
+  other direction - the engine asking the client to *do* something and waiting
+  for a result - is not an event but a `ClientHost.invoke` (above), so the
+  approval gate, the check-in, the clarify, and the skill-body fetch are
+  capabilities, not event types. The client folds events back into grow-only
+  snapshots
   with `ReplyFolder`, so rendering from events is pixel-identical to the old
   direct wiring - the property that makes local and remote engines
   indistinguishable. `thinking` is a deliberate exception to that fold:
   like `usage` and `triage-shadow` it is a side-channel the engine emits
   directly (it never touches a reply snapshot), because thinking is ephemeral -
-  the UI shows it as transient progress (VS Code's `stream.progress`) and drops
-  it the moment real output streams in, and it is never preserved past the run
-  or fed into a later request. The engine condenses a reasoning model's verbose
-  `<think>` output to its latest line (`engine/core/thinking.ts`) before
-  emitting, so what surfaces is the "important piece", not the raw chain of
-  thought; `myDevTeam.thinking.showInChat` (on by default) gates the capture, so
-  off does no extra work. `tool-call`/`ToolResultMessage` are defined for the
-  Phase-B wire; the LocalEngine calls the ToolHost in-process instead.
+  it is never preserved past the run or fed into a later request. The client
+  treats each `thinking` event only as a liveness signal, not text to show, and
+  emits no custom progress for it: the live "is reasoning" indicator is VS Code's
+  own built-in progress (the rotating "Thinking"/"Generating"/… verbs), which the
+  chat shows while the handler runs and no output has streamed yet - we no longer
+  override it with a custom label. What the client does with the event is time the
+  burst - opened on the first event, closed when real output streams or the run
+  ends - summing the spans so a `_Thought for Ns_` line can close the reply
+  (`myDevTeam.thinking.showDuration`, on by default). The engine still condenses
+  a reasoning model's verbose `<think>` output to its latest line
+  (`engine/core/thinking.ts`) before emitting, but the client never surfaces
+  that text. `myDevTeam.thinking.showInChat` (on by default) gates the capture, so
+  off does no extra work - and, with nothing captured to time, also removes the
+  duration line (the built-in indicator still shows either way).
 - **Tools are inverted.** The engine's executor never touches the workspace:
-  its Mastra tools are proxies that delegate to the client's **`ToolHost`**
-  (`tools/toolHost.ts`), which validates the arguments against the
+  its Mastra tools are proxies that delegate (through the engine-side
+  `hostFacade`, a `ToolHost` over the client's single `invoke`) to the client's
+  **`ToolHost`** (`tools/toolHost.ts`), which validates the arguments against the
   protocol's input schemas and runs the implementations - including the
   run tool's approval gate. A compromised or buggy engine can request a
   command, but it cannot run one without the user's click, and it never learns
   how approval happened. (File writes are not gated; the path and symlink
   checks still keep them inside the workspace.) The tool contract (`protocol/toolContract.ts`) carries the
-  client-facing half of each tool (input schema, `devteam__*` id, display
-  name); the engine's configs keep the model-facing half (description,
-  preview hints).
+  client-facing half of each tool (input schema, display name); the engine's
+  configs keep the model-facing half (description, preview hints).
 - **`usage` events are the billing seam.** Each workflow step reports its
   model call's token counts: the SDK's when it exposes any (input/output, plus
   reasoning, cached-input, and the provider total when present), otherwise a
@@ -385,41 +483,51 @@ the rendering. It is the proof that the engine is genuinely process-portable -
 the groundwork for a remote backend and for sharing one engine with a non-VS
 Code editor (a JVM/Kotlin client cannot import the TypeScript engine, but it can
 drive this same message protocol). It exists because the protocol was built
-wire-shaped from day one: the `tool-call` and `plan-review` events and the
-`ToolResultMessage`/`PlanDecision` answers are exactly the inversions the
+wire-shaped from day one: the run-event stream and the single `invoke`/
+`invoke-result` inversion (which carries every capability) are exactly what the
 sidecar needs, so no protocol churn was required.
 
 - **The wire** (`sidecar/transport.ts`) is a small set of parent<->child message
-  types (config, start, cancel, tool-result, plan-decision, query one way;
-  ready, event, tool-call, plan-review, result, query-result the other) behind a
-  `SidecarChannel` seam. The VS Code client carries them as `child_process.fork`
+  types (config, start, cancel, invoke-result, query one way; ready, event,
+  invoke, debug, result, query-result the other) behind a `SidecarChannel` seam.
+  Every engine->client request - a tool, a plan review, a check-in, a clarify, a
+  skill body - is one `invoke` message (named by capability) answered by one
+  `invoke-result`; the `start` message carries the real client's
+  `capabilities` so the child advertises the same set. The VS Code client carries
+  the messages as `child_process.fork`
   IPC messages with `serialization: 'advanced'` (a real structured clone, so an
   `undefined`-valued tool arg survives - the `fork` default `'json'` would drop
   it); they are all plain JSON data, so a non-Node client can frame them as
-  newline-delimited JSON over a stream instead. That NDJSON variant exists today
-  as `createStreamChannel` (next to `createForkedChannel`), proving the same
-  `SidecarEngine`/`childRuntime` pair works over a socket or stdio, not just
-  `fork` IPC - the transport a JVM/Kotlin client would target.
+  newline-delimited JSON over a stream instead. That NDJSON variant exists on
+  both ends: the parent side as `createStreamChannel` (next to
+  `createForkedChannel`), and the child side as its own entry point
+  `sidecar/stdioMain.ts` (framing in `sidecar/ndjson.ts`, bundled to
+  `dist/sidecar-stdio.js`), which speaks the identical messages over
+  stdin/stdout with every console level routed to stderr so stray output cannot
+  corrupt a frame, and exits when its stdin closes so a dead parent leaves no
+  orphan. That stdio child is what a non-Node client launches - the IntelliJ
+  (JVM/Kotlin) plugin spawns `node dist/sidecar-stdio.js` and reimplements only
+  the client half of this protocol.
 - **The child** (`sidecar/childRuntime.ts` + `sidecar/main.ts`) hosts the
   engine. Once it constructs the engine it posts a `ready` message carrying the
   `PROTOCOL_VERSION` it speaks and the engine `kind` (the readiness handshake).
   For each run it builds a `RunClient` whose `onEvent` posts an `event`
-  message, whose `ToolHost` is a **proxy** that posts a `tool-call` and resolves
-  on the matching `tool-result`, and whose `reviewPlan` posts a `plan-review`
-  and resolves on the `plan-decision` (only offered when the real client offers
-  the seam, via the start message's `canReviewPlan`). So an engine in the child
-  can only ever *ask* the client to touch the workspace or gate a plan - the
-  same inversion as in-process. The child imports no `vscode` (Part of why the
-  config and credentials seams exist); esbuild bundles it as a second entry.
+  message and whose `ClientHost` is a **proxy**: each `invoke` posts an `invoke`
+  message (with the start message's `capabilities`) and resolves on the matching
+  `invoke-result`. So an engine in the child can only ever *ask* the client -
+  named by capability - the same inversion as in-process. The child imports no
+  `vscode` (Part of why the config and credentials seams exist); esbuild bundles
+  it as a second entry.
 - **The client end** (`client/sidecarEngine.ts`) implements `Engine`: it forks
   the child (with `execArgv: []`, so the child does not inherit the host's
   `--inspect` flags under the debugger), sends the runtime-config snapshot up
   front (and again on a settings change), forwards each `event` to
-  `client.onEvent`, services a `tool-call` through the real `client.toolHost` and
-  a `plan-review` through the real `client.reviewPlan`, and settles the run's
-  `result` from the terminal `result` message - rethrowing the same
-  `RunFailedError`/`RunCancelledError` the in-process engine would. A cancel
-  aborts the in-flight tool's signal and posts `cancel`.
+  `client.onEvent`, services every `invoke` through the real `client.invoke`
+  (which routes a tool through the ToolHost and approval gate, a review / check-in
+  / clarify through its pop-up, a skill body from the bodies collected this turn),
+  and settles the run's `result` from the terminal `result` message - rethrowing
+  the same `RunFailedError`/`RunCancelledError` the in-process engine would. A
+  cancel aborts the in-flight tool's signal and posts `cancel`.
 - **Lifecycle resilience.** The parent **holds the first run** until the child's
   `ready` arrives, and rejects up front with a clear "bundle is out of date,
   reload" message on a **protocol-version mismatch** (a stale `dist/sidecar.js`)
@@ -449,6 +557,40 @@ sidecar needs, so no protocol churn was required.
   user switches engines, so a stored key does not silently stop working. MCP keeps
   working unchanged: the child's proxy `ToolHost` forwards an MCP tool call to the
   parent, where the real `McpHub` runs it.
+- **Debug logging.** When `myDevTeam.debug` is on the child traces its
+  provider-API traffic too: `createChildRuntime` injects a `DebugSink`
+  (`config/debugLog.ts`) that posts each entry to the parent as a `debug` wire
+  message, and `SidecarEngine` hands it to the `onDebug` callback the factory
+  points at the output channel - so the child's raw provider request/response
+  lands in the same "My Dev Team (Debug)" channel as the parent's
+  client<->backend trace (below). Like every other engine read, the child only
+  emits when its injected `runtimeConfig.debugEnabled` is set, so a `debug`-off
+  run posts nothing.
+
+#### Debug logging (`myDevTeam.debug`)
+
+Off by default, `myDevTeam.debug` traces a run end to end to the **"My Dev Team
+(Debug)"** output channel, for diagnosing a misroute or a malformed provider
+call. It spans both seams the engine sits behind, using the same injection
+discipline as config and secrets so the engine stays `vscode`-free:
+
+- **Client <-> backend** is logged by `traceEngine` (`client/debugLog.ts`), an
+  `Engine` decorator the factory wraps every engine in: it logs the `RunRequest`,
+  each `RunEvent`, the tool-call inversions (the `ToolHost` calls and their
+  results), and the plan/continue decisions. Because it wraps the `Engine` port,
+  it works identically for the local and the sidecar engine. When the setting is
+  off it returns the engine untouched, so there is no wrapping cost and the
+  engine's own memoised identity is preserved.
+- **Backend <-> provider** is logged by `providerDebugMiddleware`
+  (`engine/core/providerLog.ts`), an AI SDK middleware wrapped around every model
+  next to the rate limiter: it emits each call's raw request (the prompt messages)
+  and response (the generated text, taps the stream for the streaming path)
+  through `emitDebug`. The host injects a sink that writes straight to the
+  channel; the sidecar child forwards over the wire (above). It reads the flag
+  live, so it is a pass-through when debug is off.
+
+The log is verbose and carries the run's raw content (prompts, file text, model
+replies); it never leaves the machine.
 
 **Conversation history.** The handler converts `ChatContext.history` into the
 workflow's `history` turns: this participant's exchanges only (a request turn
@@ -496,10 +638,10 @@ breaking. Nested per-directory AGENTS.md files and `@import`-style includes
 are out of scope for now (see [Roadmap](#roadmap)).
 
 **References (`client/references.ts`).** A request can point the agents at
-context in two ways, and both resolve - client-side, because the engine has no
-workspace access - into the same `{ label, text }` attachments the engine
-already understands (triage sees the labels only; the planner/answerer/executor
-get the text). That attached text - and file contents the executor reads at run
+context in three ways - explicit references, inline markers, and the always-on
+active editor - and all resolve client-side (the engine has no workspace access)
+into the same `{ label, text }` attachments the engine already understands
+(triage sees the labels only; the planner/answerer/executor get the text). That attached text - and file contents the executor reads at run
 time - is untrusted: it can carry prompt-injection instructions. The
 planner/answerer/executor system prompts (`engine/config/agents/*.md`)
 explicitly frame attachments, tool results, and file contents as **data to act
@@ -535,6 +677,18 @@ injection cannot silently reach code execution.
   repository. Real `#`-variable autocomplete (a contributed chat-variable or
   tool) is a later step; today the markers are recognised as literal prompt
   tokens.
+- **The active editor** (`myDevTeam.attachActiveEditor`, on by default) is
+  attached automatically on every request - the whole open file, or just the
+  selection when text is selected (the in-memory document text, so unsaved edits
+  ride along; capped like any attachment). This resolves the deixis in "analyse
+  the current file"/"explain this selection" **on the client**, the way Copilot
+  always includes the open editor: the engine never learns about editors, and a
+  small local model is never left to guess what "the current file" means (it just
+  invents a literal path like `current_file_path`). It is skipped when the same
+  file is already covered by an explicit reference - the user's own attachment,
+  or VS Code's implicit current-file reference - so it never doubles, and added
+  after the explicit references and markers so those lead the prompt. Turn the
+  setting off to attach nothing implicitly.
 
 ### Configuration vs. code (`config/`)
 
@@ -564,24 +718,25 @@ is why `backend.json` is the sole data file there.
 | File                            | Holds                                                          |
 | ------------------------------- | ------------------------------------------------------------- |
 | `engine/config/agents/*.md`     | One agent per file: frontmatter (id, name, description, capability weights, tools) + the system prompt |
-| `engine/config/models/*.md`     | One registered model per file: frontmatter (id, user-facing label, provider `ollama`/`llamacpp`/`openai`/`anthropic`/`groq`, model name, `tier` weight class, optional `triageOnly` flag, capability scores) + a note on its strengths |
-| `engine/config/tools/*.md`      | The model-facing half of one tool per file: frontmatter (name, sideEffecting, optional previewArg - the argument shown for a call in the execution transcript, optional snippetArg - the argument whose first lines render as a snippet under the call, e.g. write's contents) + the model-facing description. The client-facing half (input schema, `devteam__*` id, display name) lives in `protocol/toolContract.ts`; the engine-only `progress` and `skill` tools have no client half |
+| `engine/config/models/*.md`     | One registered model per file: frontmatter (id, user-facing label, provider `ollama`/`llamacpp`/`openai`/`anthropic`/`groq`/`deepseek`/`zai`/`google`, model name, `tier` weight class, optional `triageOnly` flag, optional `contextWindow` in tokens for the context-usage warnings, capability scores) + a note on its strengths. **Generated files**: the source of truth is `models.yaml` in the sibling `my-dev-team-config` repo (shared with the my-dev-team pipeline); edit there and run its `scripts/sync_models.py`, never these files |
+| `engine/config/tools/*.md`      | The model-facing half of one tool per file: frontmatter (name, sideEffecting, optional previewArg - the argument shown for a call in the execution transcript, optional snippetArg - the argument whose first lines render as a snippet under the call, e.g. write's contents) + the model-facing description. The client-facing half (input schema, display name) lives in `protocol/toolContract.ts`; the engine-only `progress` and `skill` tools have no client half |
 | `engine/config/commands/*.md`   | One slash command per file: frontmatter (name, description, the pinned `intent`, `execute: false` for plan-only, optional `complexity` sizing the executor since triage is skipped - `moderate` by default) + a preamble rendered ahead of the user's prompt for the downstream agents. The same name + description pairs must be declared in `package.json` (`contributes.chatParticipants[].commands`) for autocomplete; a unit test keeps the two lists in sync |
-| `engine/config/skills/*.md`     | One built-in skill per file: frontmatter (name, description) + an instruction body. A skill is loaded on demand by the executor's `skill` tool when a task matches the description (see [Skills](#skills-engineconfigskills--clientskills)); dropping a file in registers it |
 | `config/backend.json` (project root) | The universal backend config: operator-owned settings the engine enforces (distinct from the user's VS Code settings), inlined into the build by `engine/config/backend.ts`. Namespaced - a `models` section (`disabledProviders` + `disabledModels`), a `providers` section (per-provider deployment **defaults the user can override**, not enforced floors: the endpoint default - Ollama's `endpoint`, the cloud providers' `baseUrl` - and `requestsPerMinute`, the per-provider request rate; for each, the matching user setting wins when set and this supplies the default otherwise), and an `agents` section (today `triage.model`: a model id pins it, a provider name routes by capability, default the "ollama" provider); room for more sections later - with sensible defaults so a partial file is valid. `backend.ts` validates it into the typed `backendConfig`. See [the capability router](#capability-based-model-router-engineconfigmodelsts--enginecoremodelsts) |
 | `engine/config/agents.ts`       | Loads the agent files, validates the frontmatter, exports typed `agents` |
 | `engine/config/models.ts`       | Discovers the model files, exports the registry and the capability-based `selectModel` |
+| `engine/config/steering.ts`     | `withSteering`: appends a per-model "Model-specific guidance" section to an agent's prompt, derived from the routed model's capability scores (a frontier model clears every threshold and gets nothing; weaker models pick up targeted nudges). See [the capability router](#capability-based-model-router-engineconfigmodelsts--enginecoremodelsts) |
 | `engine/config/tools.ts`        | Discovers the tool files, exports `toolConfigs`/`toolNames` and the prompt-section renderer |
+| `engine/config/partials.ts`     | Discovers the shared prompt partials (`partials/*.md`), exports the name-keyed registry and `resolveIncludes` (expands `{{ include <name> }}` in an agent body, recursing and rejecting unknown names / cycles) |
 | `engine/config/commands.ts`     | Discovers the command files, exports `commandConfigs`/`commandNames` and the pinned-route reason |
-| `engine/config/skills.ts`       | Discovers the built-in skill files, exports `builtinSkills`, `resolveSkills` (merges them with a run's discovered skills - a user skill overrides a built-in, and the first of the client's precedence-ordered list wins a name clash), and `renderSkillsSection` (the executor's name + description catalogue) |
-| `engine/config/frontmatter.ts`  | Minimal parser for the frontmatter subset the config files use |
+| `engine/config/skills.ts`       | The engine bundles no skills. `resolveSkills` de-duplicates the run's skill *metadata* (the client ships name + description, first of the precedence-ordered list wins a name clash) into the catalogue, and `renderSkillsSection` renders it. Bodies are never the engine's: the `skill` tool fetches one on demand from the client through the `tool` capability |
+| `engine/config/frontmatter.ts`  | Re-export of `config/frontmatter.ts` (the parser moved to the shared layer so the client can read SKILL.md metadata with the same parser) |
 | `config/environment.ts`         | Runtime environment facts (OS name, shell): substituted into `{{os}}`/`{{shell}}` tool-description placeholders and the agents' `{{environment}}` prompt section, sent to the engine in every run request, and the shell the `run` tool spawns (PowerShell on Windows, `/bin/sh` elsewhere) - one source so the prompts and the actual shell can never disagree |
 | `config/providers.ts`           | The single provider descriptor registry: one `ProviderDescriptor` per provider (`id`, `label`, `keyless`, `envKey`, `baseUrlSetting`, and a `build(config)` factory that imports the provider's `@ai-sdk/*` package). Everything provider-specific derives from this one list - the model-frontmatter `provider` enum and `ProviderName`, `providerLabels`, the credentials env-var map, the base-URL settings, and the lazy provider wiring - so adding a provider is one descriptor (plus its npm import), not a five-file edit. Lives in `config/` (not `engine/`) so both the engine and the client config layer can import it without violating the engine import discipline; depends only on the AI SDK packages, never on settings/credentials/backend (those resolve a provider's config and pass it into `build`) |
 | `config/settings.ts`            | The **client's** vscode-backed user settings, read live from the `myDevTeam.*` VS Code settings (see [User settings](#user-settings-contributesconfiguration)): the engine/model choice, endpoints/base URLs, disabled lists, approval/complexity toggles, the run/read/search caps, the instruction and skills lists, MCP servers, telemetry flags. Also builds `liveRuntimeConfig()`/`runtimeConfigSnapshot()` - the engine's runtime-config view/snapshot. Re-exposes the engine-read constants from `config/limits.ts` so client callers still read them via `settings`. The engine never imports this module |
 | `config/limits.ts`              | vscode-free compile-time constants the **engine** reads (executor loop/preview caps, rate-limit retry constants, the skill-body cap, repair attempts, the startup-probe timeout, the built-in Ollama and llama.cpp endpoints). Single source; `settings.ts` references them so the client-facing `settings` object still exposes them |
 | `config/uiLimits.ts`            | Compile-time constants the **client** reads, not user-tunable and not engine-read: the plan-preview "big" thresholds (`isBigPlan`), the MCP-args approval-preview cap, the status-bar item priority. The client-side analog of `limits.ts`; lives in `config/` so any client layer (`ui/`, `tools/`, `client/`) can import it without coupling to another |
-| `config/runtimeConfig.ts`       | vscode-free injected seam: the `RuntimeConfig` (the user settings the engine reads - endpoints, disabled lists, triage model, complexity toggle, request rate, snippet lines, approval, thinking/summary toggles) plus `runtimeConfig()`/`setRuntimeConfig()`. The host injects a live view (`liveRuntimeConfig()`); the sidecar child injects a pushed snapshot. Lives in `config/` (the shared layer, like `providers.ts`) so the engine can read it in any process |
-| `config/credentials.ts`         | Cloud-provider API keys behind an injectable `SecretSource` (no `vscode` dependency, so the engine reads it anywhere). The default source - and the **only** source the sidecar child uses - reads the environment variables (`OPENAI_API_KEY`/`ANTHROPIC_API_KEY`/`GROQ_API_KEY`) it inherits. The host injects a SecretStorage-backed source (`client/secrets.ts`) for the local engine, so a key set via "Set API Key" wins, env as fallback. The cloud providers and their key names come from the provider registry. Exposes `credentials.apiKey(provider)`/`has(provider)`, read live by the provider wiring |
+| `config/runtimeConfig.ts`       | vscode-free injected seam: the `RuntimeConfig` (the user settings the engine reads - endpoints, disabled lists, work model, triage model, triage mode, complexity toggle, request rate, snippet lines, approval, thinking/summary toggles) plus `runtimeConfig()`/`setRuntimeConfig()`. The host injects a live view (`liveRuntimeConfig()`); the sidecar child injects a pushed snapshot. Lives in `config/` (the shared layer, like `providers.ts`) so the engine can read it in any process |
+| `config/credentials.ts`         | Cloud-provider API keys behind an injectable `SecretSource` (no `vscode` dependency, so the engine reads it anywhere). The default source - and the **only** source the sidecar child uses - reads the environment variables (`OPENAI_API_KEY`/`ANTHROPIC_API_KEY`/`GROQ_API_KEY`/`DEEPSEEK_API_KEY`) it inherits. The host injects a SecretStorage-backed source (`client/secrets.ts`) for the local engine, so a key set via "Set API Key" wins, env as fallback. The cloud providers and their key names come from the provider registry. Exposes `credentials.apiKey(provider)`/`has(provider)`, read live by the provider wiring |
 | `config/messages.ts`            | Error text, startup warnings, reply markdown templates, the engine-switch warning, the Ollama/cloud-key hint templates the LocalEngine fills in, the /clear confirmation, the model-selection copy (the "which model ran" line, the picker prompts), the token-usage copy (the **Tokens:** line and the usage report), the status button + menu copy, the run-mirror terminal's copy, and the editor entry points' action/lens titles and framed prompts. Knows nothing about agents and almost nothing about models - the one exception is the `model` copy, since model selection is a user-facing choice |
 | `config/clientCommands.ts`      | The client-handled commands (`/clear` and `/model`, with their autocomplete descriptions) plus the `/compact` marker name the history collection watches for - client-side because conversation history and the model choice are client state. The commands unit test keeps these, the engine registry, and `package.json` in sync |
 
@@ -606,6 +761,31 @@ agent is a one-line frontmatter change. The planner's tool list only grounds
 its prompt (so it plans doable work); plan steps name no tool, the executor
 chooses how to carry each one out at run time.
 
+A rule that several agents share is not copied into each prompt. A prompt body
+embeds it with an `{{ include <name> }}` directive, replaced at load time
+(`partials.ts`, `resolveIncludes`) with the body of the matching `.md` in
+`config/partials/`, so the rule is tuned in one place instead of drifting across
+files. The partials themselves are **generated** - the source of truth is the
+shared partials library in the sibling `my-dev-team-config` repo (its
+`partials/*.md`, synced by `scripts/sync_partials.py`), which the my-dev-team
+batch pipeline embeds too, so a cross-cutting rule is tuned once for both apps;
+never edit `config/partials/*.md` by hand. Six shared partials ship today: the
+injection guard `untrusted-data` (all seven agents; each keeps only its own
+one-clause tail - the executor notes the attempt in its report, the planner
+plans only the real request, and so on), `scope-discipline`, `code-style` and
+`faithful-reporting` (the executor's discipline rules), `clarify-guidance`
+(flattened into `CLARIFY_GUIDANCE` in `core/clarify.ts` for the triage and
+responder schema descriptions) and `tdd` (registered for the planned `/test`
+preamble reuse). The include argument is normalised - a leading path and a
+trailing `.md` are stripped - so `{{ include untrusted-data }}` and
+`{{ include partials/untrusted-data.md }}` resolve alike; resolution recurses
+into nested includes and throws on an unknown name or a cycle. The unified
+syntax's conditional clause is supported too: `{{ include <name> if [not]
+<flag> }}` keeps or drops the block by a flags record passed to
+`resolveIncludes` (agent loading passes none today, so a plain `if` drops and
+an `if not` keeps - the mechanism exists for prompts that must react to a
+runtime flag, like my-dev-team's no-ask mode).
+
 Prompts never hardcode a platform either. The planner and executor prompts
 carry an `{{environment}}` placeholder, and the `run` tool's description
 carries `{{os}}`/`{{shell}}`; both are filled at load time from
@@ -628,36 +808,51 @@ see [CONFIG.md](CONFIG.md); the table below is the user-settings summary:
 | ------------------------------------ | ------------------------ | ----------------------------------------- |
 | `myDevTeam.engine`                   | `local`                  | Which engine handles `@devteam` runs: `local` (in-process), `sidecar` (same engine in a forked Node child; tools/approval/rendering stay in the editor), or `remote` (Phase B; warns and falls back to local until it exists) |
 | `myDevTeam.model`                    | `auto`                   | What the planner/answerer/executor use: a model id, a `provider:<name>` to route within one provider, or `auto` to route by capability among the available models. Triage is configured separately by `myDevTeam.triage.model`. Set it with `/model` or the "My Dev Team" status button's menu - and picking a provider or Auto there sets `triage.model` to match in one step |
-| `myDevTeam.triage.model`             | `""`                     | What triage uses, separate from the model above so the cheap classifier need not ride on the executor's model. Empty defers to the backend `agents.triage.model` floor (the "ollama" provider by default); otherwise `auto`, a `provider:<name>` (or bare provider name), or a model id, resolved by `triageRouting`. User-controlled like `myDevTeam.model`, with the disable layers still applied, so it can never reach a disabled provider/model. Set it from the `/model` picker's "Triage only" group (or a provider/Auto pick, which sets it alongside the work model) |
+| `myDevTeam.triage.model`             | `""`                     | What triage uses, separate from the model above so the cheap classifier need not ride on the executor's model. Empty cascades to the work model (`myDevTeam.model`) when it names a concrete model or provider, then to the backend `agents.triage.model` floor (the "ollama" provider by default); otherwise `auto`, a `provider:<name>` (or bare provider name), or a model id, resolved by `triageRouting`. User-controlled like `myDevTeam.model`, with the disable layers still applied, so it can never reach a disabled provider/model. Set it from the `/model` picker's "Triage only" group (or a provider/Auto pick, which sets it alongside the work model). Ignored in `combined` triage mode (there is no separate triage call) |
+| `myDevTeam.triage.mode`              | `classifier`             | How a request is routed: `classifier` (the default) runs the cheap triage step then the answerer or planner; `combined` runs one responder that triages and answers-or-plans in a single call on the **work** model (`myDevTeam.model`), saving a round-trip and removing the misroute dead-end. Only the unpinned path is affected - a slash command still pins the route and uses the dedicated agents |
 | `myDevTeam.disabledProviders`        | `[]`                     | Providers the router must never use (e.g. `["anthropic"]`): their models are skipped and shown disabled in the `/model` picker even with a key set, and never run even when pinned. The per-user layer on top of the backend floor (`config/backend.json`), which it cannot re-enable. Non-string/blank entries are ignored |
 | `myDevTeam.disabledModels`           | `[]`                     | Individual model ids the router must never use (e.g. `["qwen3-coder"]`), same two-layer hard-block semantics as `disabledProviders`: a disabled model never runs even when pinned (the run falls back to Auto) |
+| `myDevTeam.customModels`             | `[]`                     | Extra models to register without republishing the extension (e.g. a newly released Anthropic model): a list of definitions (id, label, provider, model name, optional tier/capabilities/description) merged on top of the built-in registry by `modelRegistry()`. Add-only - each must name an already-wired provider, and an id colliding with a built-in is dropped. Cloud models still need that provider's key; pin one from `/model`, or score capabilities to let Auto route to it |
 | `myDevTeam.complexityRouting`        | `true`                   | Size models to how demanding the work is (the model registry's `tier`): triage's guess sizes the planner, the planner's judgement sizes the executor; simpler work routes to a cheaper/smaller model, harder work to a stronger one. Off routes by capability alone; a pinned model is never affected |
-| `myDevTeam.planApproval`             | `auto`                   | When `@devteam` pauses to let you approve a drafted plan before it executes: `auto` only when the planner judged the work `complex`, `always` on every plan, `never` straight through. The gate offers Approve (execute), Cancel (keep the plan, run nothing), or Revise (comment, re-plan, ask again) |
+| `myDevTeam.planApproval`             | `auto`                   | When `@devteam` pauses to let you approve a drafted plan before it executes: `auto` only when the planner judged the work `complex`, `always` on every plan, `never` straight through. The gate offers Approve (execute), Cancel (keep the plan, run nothing), or Revise (comment, re-plan, ask again). On `always` a `direct` route is escalated to a drafted plan so there is something to approve |
 | `myDevTeam.planApproval.preview`     | `auto`                   | When a paused plan also opens as a read-only markdown preview beside the chat: `auto` only for a big plan (complex, or carrying design decisions, many steps, or a long write-up), `always` on every paused plan, `never` keeps review in the chat. Client-only - a pure rendering choice the engine never sees, so it does not ride the runtime-config seam; the Approve/Cancel/Revise choices stay in the chat |
-| `myDevTeam.verbosity`                | `verbose`                | How much each reply renders: `verbose` (the shipped default) shows triage's intent, reason, and complexity and the full plan with step details; `default` is terser - triage shows only the detected intent, the plan shows its summary and step titles (no per-step detail or complexity). Client-only - a pure rendering choice the engine never sees (the full reply data crosses the protocol either way), so it does not ride the runtime-config seam. Set it with `/verbose`, the "Select Output Mode" command, or the status-bar menu |
-| `myDevTeam.approval.fileChanges`     | `false`                  | Require approval before the `write`/`edit` tools change a file. Off by default (changes apply directly, since the workspace is git-backed); on routes every write and edit through the same Approve/Decline gate as `run`. `run` stays gated regardless |
+| `myDevTeam.verbosity`                | `verbose`                | How much each reply renders: `verbose` (the shipped default) shows triage's intent, reason, and complexity, the full plan with step details, and each built-in tool call's output (file content, matches, command output, the written snippet); `default` is terser - triage shows only the detected intent, the plan shows its summary and step titles (no per-step detail or complexity), and a tool call shows only the tool name and its key argument (a failed call still surfaces its error; dynamic/MCP tools are not gated). Client-only - a pure rendering choice the engine never sees (the full reply data crosses the protocol either way), so it does not ride the runtime-config seam. Set it with `/verbose`, the "Select Output Mode" command, or the status-bar menu |
+| `myDevTeam.attachActiveEditor`       | `true`                   | Auto-attach the open file as context on every request - or just the selection when text is selected - so "the current file"/"this selection" resolves without the user attaching anything (Copilot-style). Client-only (the engine just receives the attachment), so it does not ride the runtime-config seam. De-duped against an explicit/implicit reference to the same file; turn it off to attach nothing implicitly |
+| `myDevTeam.approval.fileChanges`     | `false`                  | Require approval before the `write`/`edit` tools change a file. Off by default (changes apply directly, since the workspace is git-backed); on routes every write and edit through the same Approve/Allow All/Decline gate as `run`. `run` stays gated regardless |
 | `myDevTeam.ollama.endpoint`          | `""` (unset)             | Ollama server origin (no `/api` suffix). Unset uses the deployment default in `config/backend.json`, then the built-in `http://localhost:11434`; set, your value wins over the deployment default |
 | `myDevTeam.llamacpp.endpoint`        | `""` (unset)             | llama.cpp (`llama-server`) origin (no `/v1` suffix), a keyless local provider. Unset uses the deployment default in `config/backend.json`, then the built-in `http://localhost:8080`; set, your value wins. Select it for triage with `triage.model` = `provider:llamacpp` |
 | `myDevTeam.openai.baseUrl`           | `""`                     | Optional custom base URL for OpenAI (Azure / OpenAI-compatible gateway); empty uses the default endpoint. The key comes from `OPENAI_API_KEY`, not here |
 | `myDevTeam.anthropic.baseUrl`        | `""`                     | Optional custom base URL for Anthropic (a proxy/gateway); empty uses the default endpoint. The key comes from `ANTHROPIC_API_KEY`, not here |
 | `myDevTeam.groq.baseUrl`             | `""`                     | Optional custom base URL for Groq (a proxy/gateway); empty uses the default endpoint. The key comes from `GROQ_API_KEY`, not here |
+| `myDevTeam.deepseek.baseUrl`         | `""`                     | Optional custom base URL for DeepSeek (a proxy/gateway); empty uses the default endpoint. The key comes from `DEEPSEEK_API_KEY`, not here |
+| `myDevTeam.zai.baseUrl`              | `""`                     | Optional custom base URL for Z.AI (the GLM models, a proxy/gateway); empty uses Z.AI's default endpoint (`https://api.z.ai/api/paas/v4`). The key comes from `ZAI_API_KEY`, not here |
 | `myDevTeam.provider.requestsPerMinute` | `null` (unset)         | Your override of the per-provider request rate: calls are spaced to stay under it, keeping a run within a provider's quota. Unset (the default) defers to the operator's per-provider floor in `config/backend.json`; a number overrides it in either direction, and `0` disables throttling. The user's value wins over the floor (it is the user's quota to manage). A 429 is always retried after the provider's suggested delay regardless of this |
 | `myDevTeam.run.commandTimeoutMs`     | `60000`                  | `run` tool shell-command timeout (ms)     |
+| `myDevTeam.run.allowedCommands`      | `[]`                     | Command prefixes/globs the `run` tool runs without a prompt (e.g. `git status`, `npm run *`); single non-chained commands only; a denylisted command never matches; the "Always allow" choice appends here |
+| `myDevTeam.run.deniedCommands`       | `[]`                     | Extra patterns that always prompt as destructive, unioned with a non-removable built-in floor (`rm`, `git push`, `curl`, ...); overrides the model's `dangerous` flag and any ordinary Allow-All grant |
 | `myDevTeam.read.maxLines`            | `200`                    | Max lines one `read` call returns; partial results name the range and total so the model continues |
 | `myDevTeam.search.globMaxResults`    | `200`                    | Max files a glob search returns           |
 | `myDevTeam.search.contentScanLimit`  | `500`                    | Max files a content search scans          |
 | `myDevTeam.search.contentMaxMatches` | `50`                     | Max match lines before a content search stops |
 | `myDevTeam.chat.toolSnippetLines`    | `5`                      | Leading lines of a written file (or an edit's replacement text) shown under a `write`/`edit` call in the transcript (`0` hides the snippet) |
+| `myDevTeam.executor.checkpointEverySteps`   | `100`             | Steps between executor check-ins: a long task pauses and asks "keep going or stop and summarize?" after this many tool-calling steps (`0` turns the step trigger off). Whichever of steps/seconds is reached first triggers the check-in; must be below `executor.maxSteps` to fire before the ceiling |
+| `myDevTeam.executor.checkpointEverySeconds` | `600`             | Seconds between executor check-ins (`0` turns the time trigger off). Mainly catches a run stalled on one slow tool, since the step trigger usually fires first |
+| `myDevTeam.executor.contextWarnThresholds`  | `[75, 85, 95]`    | Context-usage levels (percent of the model's window) at which a run shows a one-time caution that it is filling up; each level below `history.autoCompactThreshold` also offers a "Compact now" action. Cleaned to whole percents in (0,100], sorted and de-duplicated |
+| `myDevTeam.history.autoCompact`             | `true`            | Auto-compact the conversation once a run crosses `history.autoCompactThreshold`: the next message runs `/compact` first and continues against the summary, so a long session cannot silently overflow the window. Client-only (history is client state); anything but literal `false` is on |
+| `myDevTeam.history.autoCompactThreshold`    | `95`              | Context-usage level (percent of the model's window) at/above which the conversation auto-compacts on the next message (when `history.autoCompact` is on); below it a warning only offers "Compact now". Cleaned to a whole percent in (0,100]; set it to one of `executor.contextWarnThresholds` to line up with a warning |
+| `myDevTeam.modelContextWindows`             | `{}`              | Per-model context-window overrides in tokens, keyed by registry id (e.g. `{"qwen3-coder": 32768}`). Wins over the model's built-in `contextWindow` - needed for local models, whose real window is the server's `num_ctx`, not the theoretical max. Used only for the context-usage warnings |
 | `myDevTeam.usage.showInChat`         | `true`                   | Append a **Tokens:** line under each reply summing the run's input/output tokens. The status button's session total and the "Show Token Usage" report are independent of this flag |
 | `myDevTeam.changes.showInChat`       | `true`                   | Append a **Changes:** line ("N files changed, +X -Y") under a reply that wrote files; appears only when a turn changed files |
 | `myDevTeam.summary.showInChat`       | `true`                   | After an executed plan that changed files, add a three-section **Summary** recap; off skips the extra summarizer model call entirely |
-| `myDevTeam.thinking.showInChat`      | `true`                   | Show a reasoning model's thinking live as a transient progress line (condensed to its latest line), never kept past the run; off skips capturing reasoning entirely |
+| `myDevTeam.thinking.showInChat`      | `true`                   | Capture a reasoning model's thinking so its duration can be timed; the live "is reasoning" indicator is VS Code's own built-in progress (shown either way). Off skips capturing entirely (and removes the `Thought for Ns` line) |
+| `myDevTeam.clarify.enabled`          | `true`                   | Let the engine end a genuinely ambiguous run by asking the user (the `clarify` route) instead of guessing; off coerces a clarify decision to a normal answer, so a run always produces work |
 | `myDevTeam.instructions.files`       | `["AGENTS.md", "CLAUDE.md"]` | Root-relative file names probed for standing project instructions, in order; the first that exists is sent with every run. Plain names only (an entry with a path separator or `..` falls back to the default list); an empty list disables the feature |
-| `myDevTeam.skills.directories`       | `[".devteam/skills", ".claude/skills"]` | Relative directories scanned for skills, each at `<dir>/<name>/SKILL.md`; the matches are sent with every run, alongside the built-in skills. Looked for under every workspace root **and** the user's home directory (so `~/.claude/skills` etc. are personal skills); a workspace skill wins a name clash with a home one. An entry that is absolute or contains `..` makes the whole list fall back to the default; an empty list turns user skills off (built-ins still ship) |
+| `myDevTeam.skills.directories`       | `[".devteam/skills", ".claude/skills"]` | Relative directories scanned for skills, each at `<dir>/<name>/SKILL.md`; the metadata is sent with every run and a body loads on demand. Looked for under every workspace root **and** the user's home directory (so `~/.claude/skills` etc. are personal skills); a workspace skill wins a name clash with a home one. An entry that is absolute or contains `..` makes the whole list fall back to the default; an empty list turns skills off (the engine bundles none of its own) |
 | `myDevTeam.mcp.servers`              | `{}`                     | MCP servers whose tools `@devteam` may call, as a name -> `{ command, args?, env? }` map. Each is launched over stdio; its tools are offered namespaced `mcp__<server>__<tool>` and every call is approved like `run`. Server names must be plain identifiers; invalid entries are ignored. Nothing is contacted in an untrusted workspace; new servers take effect on a window reload |
 | `myDevTeam.write.protectedPaths`     | `[".vscode"]`            | Root-relative locations `write`/`edit` refuse to touch, on top of the always-protected `.git/` (auto-running locations that would sidestep the run gate). Matched per path segment; an entry with `..` falls back to the default list; an empty list keeps only `.git` protected |
 | `myDevTeam.telemetry.evalLog`        | `false`                  | Opt-in local eval log: store per-run route/usage/outcome records and 👍/👎 feedback as JSON lines in extension storage (no prompt or reply text; nothing leaves the machine) |
 | `myDevTeam.telemetry.shadowTriage`   | `false`                  | On a slash-command (pinned) run, also run triage in the background and record its prediction, so the usage report can score triage against the pinned route. Adds one local triage call per pinned run; only collects while the eval log is on |
+| `myDevTeam.debug`                    | `false`                  | Log every layer of a run to the "My Dev Team (Debug)" output channel: the client<->backend protocol (request, run events, tool-call inversions, plan/continue decisions) and each provider-API call's raw request + response. Works for the local and the sidecar engine (the child forwards its provider traffic). Diagnostic only - verbose, carries the run's raw content, stays on the machine |
 
 Invalid values (wrong type, non-positive numbers, an endpoint that is not an
 http(s) URL) silently fall back to the defaults, so the tools always see sane
@@ -702,10 +897,28 @@ Agents never name a concrete model. Instead:
   below), an optional `triageOnly` flag (default `false`; when `true` the model
   is eligible only for the internal triage classifier, never the Auto work pool -
   `workModels()` drops it - though an explicit pin still reaches it), and scores
-  for how good the model is at a set of capabilities - `reasoning`, `coding`,
-  `classification`, `planning`, `speed`, `structured-output` - each 0-1.
+  for how good the model is at a set of capabilities - the unified 8-name
+  vocabulary shared with the my-dev-team pipeline: `reasoning`,
+  `code-generation`, `code-analysis`, `classification`, `planning`,
+  `fast-utility`, `structured-output`, and `long-context` (scored roughly by
+  window size, so an agent that must read a lot at once can weight it high and
+  Auto routes to a big-window model) - each 0-1. The pre-unification dialect
+  names (`coding`, `speed`) are still accepted in hand-written config - e.g. an
+  existing `myDevTeam.customModels` entry - and normalised on load (`coding`
+  expands to both code capabilities; an explicit unified name wins).
+  The `.md` files are **generated** from the shared model registry
+  (`models.yaml` in the sibling `my-dev-team-config` repo, one catalogue for
+  both MyDevTeam apps): its sync script emits the registry's capability scores
+  verbatim and derives `tier` from the registry's `complexity_fit`. To add or
+  re-score a model, edit the registry and run `python scripts/sync_models.py`
+  there - never edit `models/*.md` directly.
 - **Agents** (`engine/config/agents/*.md`) declare the same capabilities as
-  *weights*: how much each one matters to that agent.
+  *weights*: how much each one matters to that agent. Their frontmatter may
+  also carry the unified sampling keys `temperature`/`top_p`/`top_k` (snake
+  case, shared with my-dev-team's agent format); they ride every
+  `generate`/`stream` call as AI SDK `modelSettings`, and an agent that sets
+  none keeps the provider defaults (today only triage pins `temperature: 0.1`
+  for stable routing).
 - `selectModel` (`engine/config/models.ts`) is pure config logic: given a
   requirement profile, an optional pin, a candidate list, and an optional
   complexity, it returns the pinned model outright or - among the candidates,
@@ -718,6 +931,25 @@ Agents never name a concrete model. Instead:
   pin still reaches it), `localModels()` (the Ollama subset),
   `routeModel`/`resolveModel` (apply the pin + candidates + complexity and wire
   the winner onto an [AI SDK](https://sdk.vercel.ai) provider instance).
+
+**User-extensible registry.** The built-in models are discovered at build time,
+but `modelRegistry()` is a *function*, not a constant: it merges those built-ins
+with whatever the user registered through the `myDevTeam.customModels` setting,
+read off the injected `runtimeConfig()` seam (so it reaches the sidecar engine
+too, and the engine stays `vscode`-free). Each custom entry carries the same
+structured fields as a model `.md` (id, label, provider, model name, optional
+`tier`/`capabilities`/`description`) and is validated against the same schema in
+`engine/config/models.ts` - the single owner of the model schema. A custom model
+needs **no new code** because it reuses an already-wired provider (the provider's
+`build` takes any model-name string), which is also why a custom entry may only
+name a registered provider, never add one. Registration is **add-only**: an
+entry that fails validation, or whose id collides with a built-in (or an earlier
+custom entry), is dropped with a warning rather than overriding or throwing -
+one bad entry must not break every run. `capabilities` is optional for a custom
+model (a pin ignores scores; a neutral 0.5 profile is filled in for Auto), so
+adding and pinning a freshly released model takes only id/label/provider/model.
+The accepted set is memoised by the raw config's content signature, so
+validation re-runs only when the setting changes.
 
 **Complexity routing.** Triage classifies not only the intent but how
 demanding the request is (`simple` | `moderate` | `complex`; see
@@ -735,11 +967,15 @@ Complexity routing is **two-stage** on the planning path. Triage's
 pre-exploration guess sizes the **planner's** model (the planner is built per
 run in the draft-plan step, like the executor). The planner then emits its own
 `complexity` field - a better-informed read, made after it has seen the request
-and drafted the steps - and that sizes the **executor's** model and is the value
-surfaced to the user (the executor falls back to triage's tier only until the
-plan exists; the streamed `model-selected` event uses triage's estimate and the
-final reply's `selection` corrects the executor entry). The answerer routes by
-capability alone. A **command-pinned** run skips triage, so the planner's tier
+and drafted the steps - and that sizes the **executor's** model (the executor
+falls back to triage's tier only until the plan exists). Because the executor's
+tier is settled only once the plan is drafted, its model is **not** shown in the
+upfront `**Model:**` line - it rides in the **execution header** (`**Execution:**
+_(model)_`), an append-only position below the now-final plan. The engine
+re-emits `model-selected` with the corrected executor entry just as execution
+begins, so the header shows the model that actually runs from its first frame;
+the streamed reply therefore never has to retract an already-shown model and
+render the whole reply twice. The answerer routes by capability alone. A **command-pinned** run skips triage, so the planner's tier
 comes from the command's frontmatter (`moderate` by default; `/fix` is
 `complex`). The gate is live: a **model pin** bypasses complexity (the user
 chose), and `myDevTeam.complexityRouting` (default on) turns it off entirely,
@@ -749,6 +985,26 @@ plan block (an append-only position that keeps streamed renders prefix-safe).
 
 The planner's `complexity` also drives the **plan-approval gate** (see "The
 plan-approval gate" below).
+
+#### Per-model prompt steering
+
+The shared agent prompts (`engine/config/agents/*.md`) describe *what* an agent
+does and assume a capable model; they do not change with the model. A weaker
+model needs extra nudging to hit the same bar, so `engine/config/steering.ts`
+derives a small **"Model-specific guidance"** section from the *routed model's*
+capability scores and `withSteering` appends it to the prompt when each agent is
+built (every agent passes its routed entry through it). Each rule fires only when
+the model scores below a threshold: `structured-output < 0.90` adds a
+strict-format reminder, `reasoning < 0.80` an explicit step-by-step instruction,
+`code-generation < 0.85` a "do not invent paths/APIs, verify with a tool" line
+(a missing score counts as 0, so an unscored model gets the full set). The thresholds sit
+just above where the frontier models score, so Opus/Sonnet/GPT-4.1 clear every
+one and get an **empty** section (extra hand-holding tends to make a strong model
+verbose or over-cautious), DeepSeek's structured-output trips the format rule
+only, and the small local models collect most of them. This keeps the rest of
+the router's future-proofing: a newly registered model needs no steering config -
+its capability scores decide automatically. To retune, edit the thresholds in
+`steering.ts`; no per-model config is involved.
 
 #### The plan-approval gate
 
@@ -760,11 +1016,13 @@ client offered the review seam, and `myDevTeam.planApproval` asks for it -
 plan `complex`, `never` not at all. With no seam (a test, or a client that
 predates it) the run never gates, so the feature is purely additive.
 
-The seam mirrors the tool seam. The client's `RunClient.reviewPlan(plan,
-complexity)` is the in-process handle (the LocalEngine passes it to the step via
-the `planReviewKey` request-context channel, the same way it passes the progress
-and usage sinks); a remote engine instead emits the `plan-review` event and
-reads back a `PlanDecision`. Either way the gate UI lives entirely on the client
+The seam mirrors the tool seam - it is the same one. The client's `reviewPlan`
+capability (`ClientHost.invoke('reviewPlan', …)`) is the handle: in-process the
+LocalEngine wraps it in `hostFacade(...).reviewPlan` and passes that to the step
+via the `planReviewKey` request-context channel (the same way it passes the
+progress and usage sinks); over the sidecar/remote engine the same call posts an
+`invoke` and reads back a `PlanDecision`. Either way the gate UI lives entirely
+on the client
 - the `ChatPlanReviewer` (`ui/chatParticipant.ts`), which renders the plan with
 inline Approve / Cancel / Revise links (a modal fallback when there is no chat
 stream), exactly as the `ChatApprover` does for the `run` tool.
@@ -792,6 +1050,35 @@ preview is only the richer reading surface, and the inline chat checklist is
 unchanged. The optional `decisions` the planner emits for a complex change (a few
 pivotal design choices, each with a rationale) are surfaced here so the user can
 judge - and, via Revise, redirect - the approach, not just the steps.
+
+#### The executor check-in
+
+A long execution can **pause to ask whether to keep going**. The executor runs
+the tool-calling loop in batches (see "Executor" below): a batch advances until
+`myDevTeam.executor.checkpointEverySteps` steps or `checkpointEverySeconds`
+seconds (whichever comes first, either disabled with `0`), and between batches -
+unless the model already finished - it asks. The seam mirrors the plan-approval
+gate exactly: the client's `confirmContinue` capability
+(`ClientHost.invoke('confirmContinue', …)`) is the handle (in-process the
+LocalEngine wraps it via `hostFacade` and passes it via the `continueReviewKey`
+request-context channel; over the sidecar/remote engine the same call posts an
+`invoke` and reads back a `ContinueDecision`). With no seam (a test, or both intervals `0`) the
+executor never checks in and runs to the `executor.maxSteps` ceiling, so the
+feature is purely additive. The `info` is a `CheckpointInfo` - steps taken,
+seconds elapsed, and the last tool used - enough for the prompt to say what is
+going on.
+
+The UI lives on the client: `ChatContinuePrompt` (`ui/chatParticipant.ts`)
+renders a "still working - keep going or stop and summarize?" line with inline
+links (a modal fallback when there is no stream), like the `ChatPlanReviewer`.
+The decision is a `ContinueDecision`: **continue** runs another batch (the model
+keeps its full context, since each batch's response messages are carried
+forward); **stop** ends the work. On stop - and likewise when the ceiling is hit
+with nobody gating - the executor appends a "wrap up, no more tools" turn so the
+run still produces a real answer from the work already done rather than an abrupt
+cut-off. A closed session (the request ended) resolves a pending check-in as
+**continue**, so it never truncates a run that was doing fine - the run's own
+cancellation path is what stops a genuinely cancelled turn.
 
 #### The provider registry (`config/providers.ts`)
 
@@ -840,12 +1127,15 @@ locally installed `llama-server`. It is wired on the **Chat Completions**
 transport (`openai.chat`), not the AI SDK's default Responses API: `llama-server`
 enforces a structured-output schema as a GBNF grammar only on
 `/v1/chat/completions`, so triage and the planner get schema-correct JSON even
-from a tiny local model. OpenAI, Anthropic, and Groq need an API key (read
-from their `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `GROQ_API_KEY` environment
-variables, or - for the local engine only - from a key stored via the "Set API
+from a tiny local model. OpenAI, Anthropic, Groq, DeepSeek, and Z.AI need an API key (read
+from their `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `GROQ_API_KEY` / `DEEPSEEK_API_KEY` /
+`ZAI_API_KEY` environment variables, or - for the local engine only - from a key stored via the "Set API
 Key" command) and accept an optional custom base URL (`myDevTeam.openai.baseUrl` /
-`anthropic.baseUrl` / `groq.baseUrl`) for Azure or an
-OpenAI-compatible/Anthropic/Groq gateway. Every provider's endpoint can also be
+`anthropic.baseUrl` / `groq.baseUrl` / `deepseek.baseUrl` / `zai.baseUrl`) for Azure or an
+OpenAI-compatible/Anthropic/Groq/DeepSeek/Z.AI gateway. Z.AI (the GLM models) is itself
+OpenAI-compatible, so it reuses the OpenAI SDK on the Chat Completions transport (`openai.chat`)
+with Z.AI's endpoint (`https://api.z.ai/api/paas/v4`) as the base-URL fallback when no override
+is set. Every provider's endpoint can also be
 given a **deployment default by the operator** in `config/backend.json`'s
 `providers` section (Ollama's `endpoint`, the cloud providers' `baseUrl`) - so a
 build ships pointing at a corporate gateway out of the box - but the user's own
@@ -929,26 +1219,32 @@ kinds of choice, all decided in `selectModel`:
 
 A model or provider pin bypasses the availability gate (the user asked for it),
 so a pinned cloud model/provider with no key still runs and fails with a hint
-to set the key, rather than being silently ignored. The user's `model` choice
-never touches **triage**: triage has its own knob, `myDevTeam.triage.model`,
-routed by `triageRouting` (core/models.ts) - **"auto" routes among the available
-models, a registered model id pins that exact model, a `provider:<name>` (or
-bare provider name) routes by capability within it, and empty defers to the
-backend `agents.triage.model` floor, the "ollama" provider** (the local models).
-Triage stays a cheap, invisible classification that should be fast and free, so
-it defaults to a local model and ignores whatever the user
-pinned for the work that follows; anyone who wants a sharper classifier - or who
-has no Ollama server - can point it at a specific model or another provider via
-`myDevTeam.triage.model` (e.g. `provider:llamacpp` for a local `llama-server`
-with no Ollama install, or a cloud provider when a key is set), with the
-operator's `agents.triage.model` as the shipped default.
+to set the key, rather than being silently ignored. **Triage** has its own knob,
+`myDevTeam.triage.model`, routed by `triageRouting` (core/models.ts) - **"auto"
+routes among the available models, a registered model id pins that exact model, a
+`provider:<name>` (or bare provider name) routes by capability within it, and
+empty cascades to the work model (`myDevTeam.model`) when that names a concrete
+model or provider, then to the backend `agents.triage.model` floor, the "ollama"
+provider** (the local models). The cascade is what makes a cloud-only setup work
+out of the box: a user who picks `provider:openai` for the work agents and sets
+no triage model gets triage on OpenAI too, rather than the local default failing
+for want of an Ollama server. When the work model is the default `auto`, triage
+stays on the cheap local floor - a fast, free, invisible classification that need
+not ride on the work model. Anyone who wants triage routed differently from the
+work agents (e.g. `provider:llamacpp` for a local `llama-server`, or a small
+local classifier while the work runs on a cloud model) sets `myDevTeam.triage.model`
+explicitly, which wins over the cascade, with the operator's `agents.triage.model`
+as the shipped default.
 
 **Surfacing the choice.** The engine emits a `model-selected` event right after
 `triaged` and attaches the same `selection` to the reply (mode
 `pinned`/`provider`/`auto`, the provider label in provider mode, plus the model
 each step used), and the chat renders a `**Model:** …` line under the triage
 block - so the user always knows which model answered, especially when Auto or
-a provider pin chose.
+a provider pin chose. The line names triage's work model (the planner on the
+planning path, the answerer on the oneshot path); the **executor's** model is
+held back to the execution header, since its tier is not settled until the plan
+is drafted (see "Complexity routing is two-stage" above).
 
 Retune an agent by editing its weights, and upgrade the whole system by
 registering a stronger model - no agent code changes either way.
@@ -956,17 +1252,19 @@ registering a stronger model - no agent code changes either way.
 The "Auto selects" column below is the local-only default (no cloud key set);
 with a key configured, Auto prefers the higher-scoring cloud models for the
 planner/answerer/executor. Triage follows its own setting, `myDevTeam.triage.model`
-(the executor's `myDevTeam.model` does not size it) - empty defers to the backend
-`agents.triage.model` floor ("ollama" by default, so it stays local), and a user
-can point it at a cloud provider when no Ollama server is available.
+- empty cascades to the work model (`myDevTeam.model`) when it names a concrete
+model or provider, then to the backend `agents.triage.model` floor ("ollama" by
+default, so an all-Auto setup stays local). So picking a cloud provider for the
+work agents carries triage along with no extra step.
 
 | Agent      | Weights (what it cares about)                                | Auto selects (local-only) |
 | ---------- | ------------------------------------------------------------ | ----------------- |
-| `triage`   | classification 1, speed 0.8, structured-output 0.5           | Ollama `qwen3:8b` |
-| `planner`  | planning 1, reasoning 0.8, structured-output 0.6, speed 0.3  | Ollama `qwen3:14b`|
-| `answerer` | reasoning 1, speed 0.9                                       | Ollama `qwen3:8b` |
-| `executor` | coding 1, reasoning 0.7, speed 0.3                           | Ollama `qwen3-coder` |
-| `summarizer` | reasoning 0.6, speed 0.9                                   | Ollama `qwen3:8b` |
+| `triage`   | classification 1, fast-utility 0.8, structured-output 0.5    | Ollama `qwen3:8b` |
+| `planner`  | planning 1, reasoning 0.8, structured-output 0.6, fast-utility 0.3 | Ollama `qwen3:14b`|
+| `answerer` | reasoning 1, fast-utility 0.9                                | Ollama `qwen3:8b` |
+| `executor` | code-generation 1, reasoning 0.7, fast-utility 0.3           | Ollama `qwen3-coder` |
+| `summarizer` | reasoning 0.6, fast-utility 0.9                            | Ollama `qwen3:8b` |
+| `compacter` | long-context 1, reasoning 0.5, code-analysis 0.3, fast-utility 0.2 | Ollama `qwen3-coder` (262K window) |
 
 ```yaml
 # engine/config/models/anthropic-opus.md - a registered model (scores):
@@ -977,7 +1275,7 @@ model: claude-opus-4-8
 tier: complex            # the weight class complexity routing sizes to
 capabilities:
   reasoning: 0.98
-  coding: 0.97
+  code-generation: 0.97
   planning: 0.97
   # …
 
@@ -986,7 +1284,7 @@ capabilities:
   planning: 1
   reasoning: 0.8
   structured-output: 0.6
-  speed: 0.3
+  fast-utility: 0.3
 ```
 
 ```ts
@@ -996,7 +1294,8 @@ model: resolveModel(agents.planner.capabilities, modelPin, undefined, complexity
 // passes none and routes by capability alone):
 model: resolveModel(agents.executor.capabilities, modelPin, undefined, complexity),
 // engine/core/triage.ts - triage routes per myDevTeam.triage.model (empty
-// defers to the backend agents.triage.model floor), never the work-model pin:
+// cascades to the work model myDevTeam.model, then the backend floor), routed
+// independently of the run's work-model pin:
 model: resolveTriageModel(agents.triage.capabilities),
 ```
 
@@ -1056,9 +1355,73 @@ replacement effect is the client's: a successful compact response resets the
 collected history to just the summary turn. Success is read from the turn's
 result metadata (`TurnMetadata.outcome`), so a failed or cancelled compact
 never wipes the history it failed to summarize - see
-[Conversation history](#the-engine-protocol-srcprotocol). Auto-compaction is
-deliberately absent: compacting spends tokens and changes what the models
-see, so it only happens when the user asks.
+[Conversation history](#the-engine-protocol-srcprotocol).
+
+**Compaction runs the compacter agent on a window-sized slice of the full
+conversation.** `/compact` is not the answerer/oneshot path: the LocalEngine
+intercepts the `compact` command (`runCompaction`) and runs the dedicated
+**compacter** agent (`engine/core/compacter.ts`, prompt in
+`engine/config/agents/compacter.md`) - a structured preservation briefing
+(goals, requirements, decisions and their rationale, files and code touched,
+current state, open items), not a terse blurb. The compacter weights the
+`long-context` capability, so Auto routes it to the biggest-window model
+available, and the engine then sizes the work to *that model's* window via
+`planCompactionChunks` (`limits.compaction.inputWindowFraction`, 60% of the
+window per pass, leaving the rest for the summary and prompt). The whole
+conversation is summarized - nothing is dropped:
+
+- When it fits one pass, it is a single call - the common case, and on a
+  big-window compacter even a long session fits.
+- When it does not, it is summarized in a **rolling refine** over oldest-first
+  chunks: pass 1 summarizes chunk 1 into a briefing; each later pass is fed the
+  briefing-so-far plus the next chunk and told to keep all of the briefing's
+  detail and only fold in the new part (the compacter agent handles a "Briefing
+  so far" section - see compacter.md), so the already-summarized part is not
+  re-compressed. Later chunks reserve `briefingReserveFraction` of the per-pass
+  budget for the carried briefing. Only the final pass streams as the visible
+  answer; earlier passes show a "Compacting (pass N of M)..." progress line and
+  sum their usage. Multi-pass mainly engages on a *small*-window model (a
+  big-window one summarizes in one pass), and the number of passes is bounded by
+  the client's coarse ceiling on what it ships.
+
+This is what makes a big-window compacter worth it - it summarizes from far more
+history per pass than a fixed cap could, and falls back to refine rather than
+dropping turns when even its window is too small. The client ships the
+conversation for a compact request up to a coarse safety ceiling
+(`history.compactInputMaxChars`); the engine does the real, window-aware sizing.
+Either way the model that *writes* the summary is the one whose window *sizes*
+each pass, so it cannot overflow. A normal follow-up still carries only the small
+standing-history view (`history.maxTurns` x `history.maxTurnChars`); the resulting
+summary is preserved at the richer `history.compactSummaryMaxChars` so the one
+turn that stands in for the whole earlier conversation is not re-truncated when
+reused. `collectHistory` takes a `caps` argument to switch between the views.
+
+For a local model the registry `contextWindow` is the theoretical maximum, not
+the server's launched `num_ctx`, so a user running a big-window model locally
+should set `myDevTeam.modelContextWindows` (which `contextWindowFor` honours) for
+the budget to match reality - the same override the context warnings use.
+
+**Compaction can also be triggered by context pressure**, since a long session
+should not have to overflow the window before the user thinks to type
+`/compact`. The executor's `context-warning` events (see below) drive two tiers,
+both decided client-side from the warning's `percent`:
+
+- *Below* `myDevTeam.history.autoCompactThreshold` (default 95%): each warning
+  carries an inline **"Compact now"** action - a trusted command link
+  (`myDevTeam.compactNow`) that opens the chat with `@devteam /compact`, i.e. the
+  manual path above. Nothing happens automatically.
+- *At or above* the threshold (with `myDevTeam.history.autoCompact` on, the
+  default): the handler flags the conversation, and its **next** turn runs a
+  hidden `/compact` before the real run, then proceeds against the summary. The
+  summary is cached per conversation (`compactionCache`) and folded in by
+  `collectHistory`, because a hidden compact - unlike a typed `/compact` - leaves
+  no visible turn whose metadata would reset the history on later turns. The pass
+  is best-effort: a failure or cancellation keeps the full history and the turn
+  proceeds normally. It is keyed by `conversationId`, so concurrent conversations
+  never cross-compact, and held in memory only (a reloaded window falls back to
+  the full history). Because the trigger is the executor's warning, it fires on
+  the planning/execution path - where context actually balloons from large reads
+  - not on a pure oneshot answer.
 
 **Side questions (`/ask` and the "btw" marker) are half-and-half.** The `/ask`
 route itself is a plain engine command (oneshot, `complexity: simple`, a
@@ -1140,45 +1503,48 @@ entry, follow a team convention) that would otherwise be repeated in prompt
 after prompt. Skills are **model-invoked with progressive disclosure** - the
 executor's prompt lists only each skill's `name: description`, and the model
 pulls in a skill's full body only when a task matches, so a skill costs nothing
-on a run that does not use it.
+on a run that does not use it. The disclosure is now lazy **over the wire** too:
+only the metadata rides on the request, and a body crosses only when loaded.
 
-- **Two kinds of source, merged per run.** Built-in skills are `.md` files in
-  `engine/config/skills/` (frontmatter `name` + `description`, instruction body),
-  discovered by the glob import at build time like the commands and tools.
-  User skills are `SKILL.md` files the client finds (`client/skills.ts`) under
-  the configured directories (`myDevTeam.skills.directories`, default
-  `.devteam/skills` and `.claude/skills`, each at `<dir>/<name>/SKILL.md`), looked
-  for in **two base locations**: every workspace root (a skill committed to the
-  project) and the user's **home directory** (a personal skill shared across
-  projects, e.g. `~/.claude/skills/<name>/SKILL.md`). The client lists the
-  directory entries with `vscode.workspace.fs.readDirectory` and ships each file
-  as **raw text** on `RunRequest.skills` - reading fresh per request, so an edit
-  takes effect on the next message (the same client-side, stateless-engine
-  discipline as the instruction file). The engine's `resolveSkills` parses the
-  shipped skills with the one frontmatter parser and drops a malformed one rather
-  than failing the run.
-- **Precedence is explicit: workspace > home > built-in.** A user skill
-  overrides a built-in of the same name, and among user skills the client ships
-  them **highest precedence first** (workspace roots before the home directory,
-  directories in their listed order) while `resolveSkills` keeps the **first**
-  occurrence of each name - so a project's skill beats a personal one, and a
-  personal one beats a built-in. Each resolved body is capped to
-  `settings.skills.maxChars`.
+- **All skills come from the client; the engine bundles none.** Skills are
+  `SKILL.md` files the client finds (`client/skills.ts`) under the configured
+  directories (`myDevTeam.skills.directories`, default `.devteam/skills` and
+  `.claude/skills`, each at `<dir>/<name>/SKILL.md`), looked for in **two base
+  locations**: every workspace root (a skill committed to the project) and the
+  user's **home directory** (a personal skill shared across projects, e.g.
+  `~/.claude/skills/<name>/SKILL.md`). The client lists the entries with
+  `vscode.workspace.fs.readDirectory`, parses each file's frontmatter with the
+  **shared** parser (`config/frontmatter.ts`, the same one the engine's config
+  loaders use), and ships only `{ name, description, source }` on
+  `RunRequest.skills` - keeping each body in memory to serve on demand. Reading
+  fresh per request means an edit takes effect on the next message (the same
+  client-side, stateless-engine discipline as the instruction file); a malformed
+  SKILL.md or one with no `name` is dropped rather than failing the turn.
+- **Precedence is explicit: workspace > home.** The client ships skills
+  **highest precedence first** (workspace roots before the home directory,
+  directories in their listed order) and keeps the **first** occurrence of each
+  name in both the shipped metadata and the body map - so a project's skill beats
+  a personal one. The engine's `resolveSkills` re-applies the same first-wins
+  de-dup on the metadata it receives. Each body is capped to
+  `settings.skills.maxChars` by the client.
 - **Executor-only.** Only the executor consumes skills - it is the one agent
-  with a runtime tool-calling loop. `resolveSkills` yields a catalogue
+  with a runtime tool-calling loop. `resolveSkills` yields the catalogue
   (`name` + `description`, rendered into the executor's prompt as an
   `--- Available skills ---` section and attributed in the usage breakdown's
-  `skills` field) and a `name -> body` map. The oneshot/answerer path has no
-  tool loop, so it gets no skills.
-- **The `skill` tool is engine-only, like `progress`.** It is built in
-  `buildAgentTools` (no client implementation, no approval gate); its
-  `execute({ name })` returns the body from the per-run map (or a short "no such
-  skill" notice), and Mastra feeds that straight back to the model - so the body
-  enters the model's context only when a skill is actually loaded. The call
-  flows through the normal transcript path, rendering as a `skill <name>` tool
-  event (its `previewArg` is `name`), so the user sees which skill was loaded.
-  No client tool contract exists for it (`protocol/toolContract.ts` carries only
-  the workspace tools).
+  `skills` field); the bodies are not the engine's to hold. The oneshot/answerer
+  path has no tool loop, so it gets no skills.
+- **The `skill` tool is a client call, just with an engine-side schema.** It is
+  built in `buildAgentTools` (no approval gate) and delegates to the client's
+  `skill` handler through the host's `tool` capability - exactly like a workspace
+  tool, but its (model-facing) argument schema lives engine-side since it has no
+  `clientTools` contract. The client returns the loaded body (or composes a "no
+  such skill" notice), and Mastra feeds that straight back to the model. So a body
+  enters the model's context, **and crosses the wire**, only when a skill is
+  actually loaded. The call flows through the normal transcript path, rendering as
+  a `skill <name>` tool event (its `previewArg` is `name`), so the user sees which
+  skill was loaded. Because it rides the one `tool` capability like every other
+  model tool, `skill` (and `clarify`) work identically over the in-process,
+  sidecar, and remote engines - no dedicated seam to bridge.
 
 ### MCP tools (`client/mcp.ts`)
 
@@ -1218,17 +1584,80 @@ extending the static contract.
   transport, MCP resources/prompts, and a per-tool trust allowlist are
   follow-ups (TODO.md chapter 26).
 
+### Planner (`engine/core/planner.ts` + `engine/core/agentTools.ts`)
+
+The planner turns a "planning" request into an ordered plan. It is a
+tool-calling agent like the executor, but its product is **structured output**,
+not a transcript:
+
+- **It explores before it commits.** The `Planner` wraps a Mastra `Agent`
+  built with `tools: buildPlannerTools(toolHost)` - read-only `read`/`search`
+  proxies onto the same ToolHost the executor uses (so the plan is grounded in
+  the files that are actually there), plus an engine-built `clarify` tool (built
+  only when the run's offered tools include it). It never writes, edits, or runs
+  commands - that is the executor's job. This makes the planner's `complexity` a
+  genuine *post-exploration* read, which then sizes the executor's model.
+- **Same loop, same limits as the executor.** It runs through the shared
+  `runToolLoop` (`toolLoop.ts`), so it batches to the same `executor.maxSteps`
+  ceiling and pauses at the same `executor.checkpointEvery*` check-ins via the
+  same `confirmContinue` seam; a cut-short run appends a "stop exploring, emit
+  the plan now" wrap-up turn.
+- **The plan is the model's structured output, produced on the terminal step.**
+  Each batch streams with `structuredOutput: { schema: PlanSchema }`; the planner
+  drains `fullStream` for tool calls and the partial-plan `object` chunks
+  (forwarded as plan snapshots), and reads the final validated plan from
+  `output.object`. `parseWithRepair` still wraps the whole loop, so a malformed
+  final plan re-runs once with the schema error appended (`repair.ts`).
+- **The `clarify` tool is a client call, just with an engine-side schema.** Like
+  `skill`, it delegates to the client through the host's `tool` capability rather
+  than touching the workspace: its `execute` forwards the questions to the
+  client's `clarify` handler and returns the user's answers (which the client
+  composes into the tool-result string) into the loop, so the planner keeps
+  drafting in the same turn. It is built only when the run offers it (the client
+  lists `clarify` when it can show the pop-up; absent, the planner drafts from a
+  reasonable assumption). The client renders the questions in a pop-up (see
+  `ChatClarifyPrompt`); because it rides the one `tool` capability, it works over
+  the sidecar/remote engine too, not just in-process.
+
 ### Executor (`engine/core/executor.ts` + `engine/core/agentTools.ts`)
 
 The executor is the step that turns a drafted plan into actual work. Design
 decisions, in the order they matter:
 
-- **Mastra drives the loop, not hand-rolled control flow.** The `Executor`
-  wraps a Mastra `Agent` constructed with `tools: buildAgentTools(toolHost)` -
-  proxies that delegate every call to the client's ToolHost - and calls
-  `agent.stream(prompt, { maxSteps: settings.executor.maxSteps })`.
-  Mastra handles the model→tool-calls→results→model iteration; the step cap
-  bounds a runaway loop. The executor itself only *observes* the run.
+- **Mastra drives the loop, in user-gated batches (the shared `toolLoop.ts`).**
+  The `Executor` wraps a Mastra `Agent` constructed with
+  `tools: buildAgentTools(toolHost)` - proxies that delegate every call to the
+  client's ToolHost - and runs it through `runToolLoop`: each
+  `agent.stream(messages, { stopWhen: [stepCountIs(interval), <time>] })` call
+  advances the model→tool-calls→results→model iteration until the check-in
+  interval (`executor.checkpointEverySteps` steps, or
+  `executor.checkpointEverySeconds` seconds, whichever first). Between batches,
+  if the model has not finished on its own, the loop calls the client's
+  `confirmContinue` seam: **continue** runs another batch carrying the
+  conversation forward (the batch's `response.messages` are appended, so the
+  model keeps its full context), **stop** ends the work. The
+  `executor.maxSteps` ceiling is the hard runaway backstop - reached only when
+  nobody is gating (no `confirmContinue` seam, or both intervals `0`). When the
+  run is cut short - by a "stop" or by the ceiling - it appends a "wrap up, no
+  more tools" turn (`toolChoice: 'none'`) so the run still yields a real,
+  in-context answer instead of an abrupt cut-off. The agent itself only
+  *observes* each batch's chunks; per-batch token counts are summed into one
+  usage record. **`toolLoop.ts` owns all of this batch/checkpoint/finalize/
+  usage/context machinery and is shared with the planner** (see below): each
+  agent supplies only a `streamBatch` callback (how to stream + drain its own
+  chunks) and the result assembly, so the subtle loop logic lives in one place.
+- **Context-usage warnings.** After each batch the executor compares how full
+  the model's context window is against `myDevTeam.executor.contextWarnThresholds`
+  (default `[75, 85, 95]`) and emits a one-time `context-warning` for each
+  threshold first crossed. The window comes from `contextWindowFor(modelId)` -
+  the user's `myDevTeam.modelContextWindows` override, else the model's built-in
+  `contextWindow` - so it is skipped when neither is known. Fill is measured from
+  the most recent batch's provider-reported input tokens (the real size of what
+  was sent), falling back to a length estimate over the carried messages when the
+  provider reports none (flagged `estimated`). The engine never truncates - the
+  client decides what to do with each warning: below `history.autoCompactThreshold`
+  it offers a "Compact now" action, at/above it (with `history.autoCompact` on) it
+  auto-compacts on the next turn (see [Context commands](#slash-commands-engineconfigcommands--engineconfigcommandsts)).
 - **Briefing.** The executor's prompt (`executionPrompt` in
   `engine/core/workflow.ts`) is the full request - the conversation so far, the
   prompt, and the inlined attachment text, exactly what the planner saw -
@@ -1237,8 +1666,8 @@ decisions, in the order they matter:
   name no tool; the executor decides how to carry each one out. The plan is
   guidance, not a script: the system prompt tells the model to follow it in
   order but skip steps already covered by earlier results.
-- **The product is a transcript.** `Executor.execute` drains the run's
-  `fullStream` of chunks and folds them into an ordered list of events
+- **The product is a transcript.** `Executor.execute` drains each batch's
+  `fullStream` of chunks and folds them into one ordered list of events
   (`ExecutionSchema`): `text` events (the model's commentary and final
   report, accumulated from `text-delta` chunks) interleaved with `tool`
   events (`tool-call` chunks open one with the tool name and an input
@@ -1282,21 +1711,52 @@ decisions, in the order they matter:
   transcript (they are not part of what the run produced) and instead condenses
   the buffer to its latest line (`condenseThinking`, `engine/core/thinking.ts`),
   forwarding it to an optional `onThinking` callback. That line travels as a
-  `thinking` event the UI shows as transient progress and then drops - the
-  "important pieces" of the model's reasoning, never the raw chain of thought,
-  and never kept past the run. Capture is wired only when
+  `thinking` event, but the UI no longer surfaces the text: it uses the event
+  only as a liveness signal to time the reasoning burst (VS Code's own built-in
+  progress indicator stands in for the live "is reasoning" state), never the raw
+  chain of thought, and never keeps it past the run. Capture is wired only when
   `myDevTeam.thinking.showInChat` is on, so off costs nothing.
 - **Rendering.** `renderReply` appends an `**Execution:**` section after the
   (now complete, so unconservatively rendered) plan. Each event's markdown is
   itself append-only - the call line is emitted when the call starts and the
   result suffix when it lands - so successive renders stay prefix-extensions
   of each other, which is exactly what the append-only `ReplyStreamer`
-  needs. A tool call still awaiting its result ends a partial render.
+  needs. A tool call still awaiting its result ends a partial render, and
+  `formatExecution` reports that truncation (`complete: false`) so `renderReply`
+  withholds the end-of-run **Summary:** until the transcript has finished
+  rendering - appending it onto a transcript cut short at a pending tool call
+  would stream the summary out *ahead* of the results that land later, and the
+  append-only chat could only re-add those results after the summary already
+  shipped (an out-of-order, duplicated-summary transcript).
   Previews are flattened to one backtick-safe line; an empty result renders
-  as `(no output)`.
+  as `(no output)`. The one way the prefix-extension invariant breaks is a
+  structured-output step (planner or summarizer) that re-streams a fresh object
+  after a `parseWithRepair` retry: the stale partial already shown can no longer
+  be extended, and the chat is append-only so it cannot be retracted. When the
+  final reply is not an extension of what was streamed, `ReplyStreamer.finish`
+  re-emits only the diverged tail (from the last shared line,
+  `sharedLinePrefixLength`) on a fresh blank line - so a late repair re-prints at
+  most the summary or plan, never the whole intent/model/plan/transcript.
+  That held-back tail is also why the client serializes a step's tool calls
+  (`client/serialQueue.ts`, wrapped around the run's ToolHost in the handler).
+  The executor prompt asks the model to call one tool at a time (so it should not
+  batch a step's calls in the first place), but that is guidance, not a guarantee:
+  if the model does fire several at once, the approval prompts and the check-in
+  render straight to the stream, out of band, so running them concurrently would
+  interleave several prompts with a transcript truncated at the first pending call
+  and surface a later call (the run command) ahead of the earlier writes. The
+  queue is the backstop that holds the order regardless. Running them one at a time, in call order, keeps each call's
+  line, prompt, and result together - and keeps a dependent call from racing the
+  files it needs. Serializing fixes execution order but not render order on its
+  own: a finished call's result reaches the chat asynchronously (the engine reads
+  the model SDK's output stream on the event loop), while a tool's approval prompt
+  renders synchronously inside its execution, so a later call's prompt could still
+  print ahead of the earlier results still in flight. The wrapper therefore yields
+  one macrotask before each queued call, letting those pending results render
+  first.
 - **Approvals live in the host, not the engine.** The proxies delegate to
-  the same `WorkspaceToolHost` the editor-wide registrations use, so `run`
-  invokes the same `Approver` with the same command echo - and the engine
+  the `WorkspaceToolHost` (through the run's `ClientHost`), so `run`
+  invokes the `Approver` with the command echo - and the engine
   never learns how the decision was made. A decline is not an error: the tool
   returns the "not approved" message and the system prompt tells the model to
   skip that action and note it in the report. `write` and `edit` are not
@@ -1315,8 +1775,8 @@ which is the narrative to the latter's exact stat.
   `parseWithRepair`, forwarding each partial snapshot and reporting usage under
   the `summarize` step - so a schema miss self-repairs and the extra call is
   metered, exactly as for triage and the planner. It carries no tools and routes
-  to the fast tier (reasoning 0.6, speed 0.9): summarizing is cheap, low-stakes
-  work.
+  to the fast tier (reasoning 0.6, fast-utility 0.9): summarizing is cheap,
+  low-stakes work.
 - **Briefed from the transcript.** `summaryPrompt` (`engine/core/workflow.ts`)
   gives it the same request prefix the other agents saw, the drafted plan, and a
   rendered execution transcript (one line per tool call with its result, plus
@@ -1334,28 +1794,27 @@ which is the narrative to the latter's exact stat.
 
 ### Tools (`tools/`)
 
-Declared in `package.json` under `contributes.languageModelTools` and
-registered with `vscode.lm.registerTool` in `registerTools.ts`. The
-implementations in `workspaceTools.ts` are UI-agnostic, and every call -
-from either surface - goes through the one `WorkspaceToolHost`
-(`tools/toolHost.ts`), which validates the arguments against the protocol's
-input schemas and dispatches. Dispatch is derived from the contract, not
-written per tool: a handler map keyed by the `clientTools` names (typed
-against each tool's schema, so it cannot drift from the contract) replaces a
-hand-written switch, and `execute` is "look the tool up, parse with its
-schema, call its handler". `registerTools.ts` registers each tool with
-the Language Model Tools API delegating to the host (so any tool-calling
-chat model in the editor can invoke them), and the engine's executor loop
-reaches the same host through its tool proxies (`engine/core/agentTools.ts`).
-Either way the same Approver gates the one gated tool, `run`.
+The tools are **private to `@devteam`**: they are *not* contributed as editor-wide
+Language Model Tools (no `package.json` `contributes.languageModelTools`, no
+`vscode.lm.registerTool`), so no other chat model in the editor can call them.
+The only way in is the run's `ClientHost` `tool` capability. The implementations
+in `workspaceTools.ts` are UI-agnostic, and every call goes through the one
+`WorkspaceToolHost` (`tools/toolHost.ts`), which validates the arguments against
+the protocol's input schemas and dispatches. Dispatch is derived from the
+contract, not written per tool: a handler map keyed by the `clientTools` names
+(typed against each tool's schema, so it cannot drift from the contract) replaces
+a hand-written switch, and `execute` is "look the tool up, parse with its schema,
+call its handler". The engine's executor loop reaches the host through its tool
+proxies (`engine/core/agentTools.ts`) - via the engine-side `hostFacade` over the
+client's single `invoke`. The same Approver gates the one gated tool, `run`.
 
-| Tool                   | Effect                          | Approval        |
-| ---------------------- | ------------------------------- | --------------- |
-| `devteam__read`        | Read a file's text, whole or a line range | none (read-only)|
-| `devteam__search`      | Glob file names or grep content | none (read-only)|
-| `devteam__run`         | Run a shell command (configurable timeout, 60s default) | **Approver** (always) |
-| `devteam__write`       | Create/overwrite a file         | **Approver** when `myDevTeam.approval.fileChanges` is on (off by default) |
-| `devteam__edit`        | Replace text in an existing file | **Approver** when `myDevTeam.approval.fileChanges` is on (off by default) |
+| Tool       | Effect                          | Approval        |
+| ---------- | ------------------------------- | --------------- |
+| `read`     | Read a file's text, whole or a line range | none (read-only)|
+| `search`   | Glob file names or grep content | none (read-only)|
+| `run`      | Run a shell command (configurable timeout, 60s default); takes an optional `dangerous` flag the model sets for a destructive/irreversible command | **Approver** (always, unless on the `run.allowedCommands` allowlist; escalated prompt + separate "Allow All" scope when `dangerous` **or denylisted**, which also subsumes the ordinary `run` scope - see the command policy under Approvals) |
+| `write`    | Create/overwrite a file         | **Approver** when `myDevTeam.approval.fileChanges` is on (off by default) |
+| `edit`     | Replace text in an existing file | **Approver** when `myDevTeam.approval.fileChanges` is on (off by default) |
 
 **Why `write`/`edit` are ungated by default.** The extension targets a
 git-backed workspace, so a file the agent overwrites or edits is recoverable
@@ -1365,8 +1824,8 @@ box `write`/`edit` apply directly. Git is not a complete safety net (it does not
 cover uncommitted edits, untracked files, or `.gitignore`d paths), and some
 users want a confirmation step regardless, so the gate is **available as an
 opt-in**: with `myDevTeam.approval.fileChanges` on, every write and edit goes
-through the same `Approver` as `run` (Approve/Decline, the file untouched on a
-decline). The write gate is asked after the path is validated and the
+through the same `Approver` as `run` (Approve/Allow All/Decline, the file
+untouched on a decline). The write gate is asked after the path is validated and the
 protected-path check passes; the edit gate is asked only once the edit is known
 to apply (file exists, `oldText` matched uniquely), so the user is never
 prompted for a change that would be refused or fail anyway. Whether or not the
@@ -1425,11 +1884,16 @@ tool-calling chat model in the editor, not just `@devteam`):
   refuses anything over `read.maxFileSizeBytes` (10 MB)** with a notice, so a
   multi-GB or giant minified file is never pulled whole into the extension host
   just to be capped - the same size guard the attachment reader and the content
-  scan apply. An optional `startLine`/`endLine` pair selects a 1-based inclusive
+  scan apply. A read of a **missing file** returns a short recovery message that
+  names the path and points at `search`/`write`, never the raw fs error (which
+  would spell out `ENOENT`, the `stat` verb, and the absolute path). An optional
+  `startLine`/`endLine` pair selects a 1-based inclusive
   range; a partial result is prefixed with the range shown, the file's total
-  line count (counted `wc -l` style), and the `startLine` to continue with, and
-  the tool description tells the model it can count a file's lines with a `run`
-  command first.
+  line count (counted `wc -l` style), and the `startLine` to continue with. The
+  tool description (and the executor's own rules) push the model toward **few
+  large reads over many small windows** - request a wide range or the whole file
+  in one call, and use `search` to jump to a known region - so a read-heavy run
+  does not fritter its step budget paging a file 60 lines at a time.
 - `edit` replaces an **exact, unique match**: the given old text must match
   exactly one place in the file (a model that misremembers the file gets a
   recovery instruction - re-read, or add surrounding lines - instead of a
@@ -1481,10 +1945,17 @@ tool-calling chat model in the editor, not just `@devteam`):
 - `run` executes with a configured timeout (`myDevTeam.run.commandTimeoutMs`)
   and output buffer; on expiry or cancellation the **whole spawned process
   tree** is killed (`taskkill /t` on Windows, a process-group signal to the
-  detached child elsewhere), so grandchild processes never linger. A failed
-  command's stdout and stderr are returned so a caller can diagnose it, and
-  the model-facing result is capped (`settings.runResultMaxChars`, head and
-  tail kept) so one chatty command cannot flood a small model's context.
+  detached child elsewhere), so grandchild processes never linger. A command
+  that *ran but failed* - a non-zero exit or a timeout - **rejects** (carrying
+  its stdout/stderr as the error message), so the failure crosses the tool seam
+  as a failed call: the executor marks the transcript event failed (the
+  `**failed**` marker shows even in default mode) and the run continues so the
+  model can fix it, rather than the model receiving a plain string it might read
+  as success (a killed-by-timeout run in particular). A *decline* at the approval
+  gate, a Restricted-Mode/virtual-workspace refusal, and a *cancellation* are not
+  failures and still return their message. The model-facing result (or error
+  message) is capped (`settings.runResultMaxChars`, head and tail kept) so one
+  chatty command cannot flood a small model's context.
   Commands run in the shell `config/environment.ts` announces to the model:
   **PowerShell on Windows** (its Unix-style aliases absorb residual
   `ls`/`cat` habits, and models write it more reliably than cmd.exe batch),
@@ -1515,14 +1986,60 @@ refuse in an untrusted folder, and `run` also refuses in a virtual workspace
 need - they go through `vscode.workspace.fs`). A refusal returns a short reason
 the model relays; no approval prompt is shown for an action that cannot run.
 
-The only gated tool, `run`, calls `approver.confirm(title, detail)` with the
-command echo, so a shell command - which can reach outside the workspace and
+The only gated tool, `run`, calls `approver.confirm(title, detail, scope)` with
+the command echo, so a shell command - which can reach outside the workspace and
 is not git-recoverable - never runs silently. The Phase-1 `ChatApprover`
 renders the proposed command into the chat panel followed by inline **Approve /
-Decline command links** (a single trusted-markdown block whose `isTrusted` is
-scoped to just the `myDevTeam.approval` command, so the two choices sit on one
-line rather than stacking as `stream.button` parts do) and blocks
-the tool until one is clicked. Each request opens its own **approval session**
+Allow All / Decline command links** (a single trusted-markdown block whose
+`isTrusted` is scoped to just the `myDevTeam.approval` command, so the choices
+sit on one line rather than stacking as `stream.button` parts do) and blocks
+the tool until one is clicked. **Allow All** approves the call and records its
+`scope` so later calls with the same scope skip the prompt; the allowance is
+kept per `scope` *and* per chat conversation (keyed by the `conversationId` the
+session carries), so it never carries from one tool to another - allowing `run`
+does not allow `write`, and each MCP tool, scoped by its namespaced name, is
+remembered on its own - and a new conversation (which `/clear` forces by minting
+a fresh `conversationId`) starts asking again. The `scope` is the tool name for
+the built-in tools and the namespaced tool name for an MCP call; it crosses no
+process boundary (the engine never sees the `Approver`). A `run` the model flags
+as **`dangerous`** (a destructive or irreversible command - `rm -rf`, `git reset
+--hard`, a force-push) - **or** one that matches the **denylist** (see the
+command policy below) - is escalated: the prompt carries a warning title and a
+warning line in the previewed command, and it uses a distinct scope
+(`run:dangerous`), so an "Allow All" granted for ordinary commands never silently
+approves a destructive one - it asks again and remembers its own allowance
+separately. The subsumption is one-directional: "Allow All" on a *destructive*
+command also records the ordinary `run` scope, so a user who waved the riskier
+command through is not asked again for the safer ones.
+
+**Command policy (`tools/commandPolicy.ts`).** Two lists shape the `run` gate,
+pulling in opposite directions. The **allowlist**
+(`myDevTeam.run.allowedCommands`, prefix or `*`-glob patterns like `git status`,
+`npm test`, `npm run *`) is a convenience: an ordinary command that matches runs
+with **no prompt** - but only a single, non-chained command is eligible (any
+shell operator `&&`, `;`, `|`, redirection, or substitution disqualifies it), so
+a listed prefix cannot smuggle an unlisted command past the gate. Each `run`
+prompt for an ordinary command also offers a third **"Always allow commands like
+this"** choice (alongside Approve / Allow All) that appends the command's leading
+prefix - extended to a subcommand, `git status` not just `git` - to
+`run.allowedCommands` via `AlwaysAllowOption.apply`; unlike the in-memory,
+per-conversation "Allow All", this **persists** across conversations and
+sessions. The **denylist** (a non-removable built-in floor - POSIX `rm`, `git push`,
+`git reset`, `curl`, `wget`, ... and the PowerShell cmdlets the Windows shell
+uses, `Remove-Item`, `Stop-Computer`, `Invoke-Expression`, `Format-Volume`, ...,
+matched case-insensitively - unioned with the user's
+`myDevTeam.run.deniedCommands`) is the safety net: a matching command always
+prompts and is forced to the `run:dangerous` scope **regardless of the model's
+`dangerous` flag**, and is never covered by the allowlist or an ordinary
+Allow-All grant. Because the `dangerous` flag is the model's own output - decided
+from possibly-untrusted request and file content - the denylist is what stops an
+injected, ordinary-looking destructive command from riding an existing grant
+(the audit's finding B-1). The denylist scans every chained segment, so a denied
+verb cannot hide behind `&&` or a pipe. The lists live on the client (this is the
+approval gate, the user's machine), so they read settings and may call `vscode`;
+the engine never sees them.
+
+Each request opens its own **approval session**
 for its stream, keyed by the run id; a finished or cancelled request closes its
 session, declining only its own still-pending approvals - so a run can never
 hang on an unanswered question, and concurrent chat turns cannot settle (or
@@ -1530,10 +2047,11 @@ write into the stream of) one another's approvals. The handler binds the run's
 tool calls to that session by tagging each `ToolHost.execute` with the run's
 correlation id (the engine never sees it), so `confirm` renders the prompt in
 the turn that owns the call rather than the most recently opened one - the
-attribution is no longer best-effort. When the tool is invoked outside a
-`@devteam` turn (the tools are registered editor-wide, so any chat model can
-call them) the call carries no id and there is no session to ask in, so the
-approver falls back to the most recent session and then to a modal dialog; a
+attribution is no longer best-effort. When a confirm carries no id and there is
+no session to ask in (a defensive path - the tools are private to `@devteam`, so
+in practice every call is tagged), the approver falls back to the most recent
+session and then to a modal dialog (whose **Allow All** button is remembered for
+the window's lifetime, there being no conversation to scope it to). A
 prompt carrying an id whose session has already closed drops straight to the
 modal rather than leak into a concurrent turn. A declined `run` returns "not approved" to the model, which is
 told to skip the command. `write` and `edit` apply without a prompt by default,
@@ -1643,16 +2161,19 @@ single
 "My Dev Team" status-bar button surfaces both: hovering it shows a rich popup (a
 trusted markdown tooltip with command links, the same approach as Copilot's
 status item) and clicking it opens a quick-pick menu, either way letting you
-change the model or open the token-usage report. The hover and the menu rows
-show the active model and the session token total.
+change the model, switch the routing mode (`myDevTeam.triage.mode`), switch the
+output mode, or open the token-usage report. The hover and the menu rows show
+the active model, the current routing mode, the current output mode (verbosity),
+and the session token total.
 
 You choose the model with `/model` (or the status button's menu): a registry id
 pins the planner, answerer, and executor to that model, while `Auto` (the
 default) routes each by capability among the available models - Ollama plus any
 cloud provider (OpenAI, Anthropic) whose API key you have exported as an
-environment variable. Triage is not affected by this choice - it has its
-own `myDevTeam.triage.model` setting (empty defers to the backend
-`agents.triage.model` default, a local Ollama model). Every
+environment variable. Triage has its own `myDevTeam.triage.model` setting; when
+that is empty it follows this work-model choice (when you pick a concrete model
+or provider), and only an all-`Auto` work model leaves triage on the backend
+`agents.triage.model` default (a local Ollama model). Every
 run renders a `**Model:**` line under the triage block naming what ran, so you
 always know which model answered - especially in Auto mode.
 
@@ -1736,8 +2257,12 @@ Out of the box, `@devteam <prompt>`:
    executor's routed model (currently `qwen3-coder`, now sized by the planner's
    complexity) is briefed with the full
    request plus the numbered plan and runs a Mastra tool-calling loop over
-   `read`/`search`/`run`/`write`/`edit` (up to `settings.executor.maxSteps`
-   iterations). The executor changes an existing file with `edit` (an exact,
+   `read`/`search`/`run`/`write`/`edit` (up to the `settings.executor.maxSteps`
+   ceiling). On a long task it pauses at check-ins (every
+   `myDevTeam.executor.checkpointEverySteps` steps or
+   `checkpointEverySeconds` seconds): the `ChatContinuePrompt` renders a "still
+   working - keep going or stop?" line with inline links; **stop** ends the
+   work with an in-context summary of what was gathered. The executor changes an existing file with `edit` (an exact,
    unique text replacement; on a failed or ambiguous match the tool answers
    with a recovery instruction instead of touching the file) and uses `write`
    for new files and full rewrites. The planner and executor prompts state the host OS and shell
@@ -1754,6 +2279,14 @@ Out of the box, `@devteam <prompt>`:
    file (and an `edit` call the first lines of its replacement text) in a
    fenced snippet under its line (`myDevTeam.chat.toolSnippetLines`,
    default 5; `0` hides it); longer content ends in an `. . . (truncated)` line.
+   A built-in tool call's output - the result preview and any snippet (file
+   content for `read`, matches for `search`, command output for `run`, the
+   written text for `write`/`edit`) - is gated by the `myDevTeam.verbosity`
+   output mode: `verbose` (the default) shows it, `default` shows only the tool
+   name and its key argument, and a failed call surfaces its error either way
+   (dynamic/MCP tools are not gated). See
+   [Configuration](#configuration-config); the gate is a pure rendering choice in
+   `renderReply`, the engine still emits the full transcript.
    From time to time the executor also calls its engine-only `progress` tool,
    which renders inline as a "**Progress:**" checklist of the plan steps with
    each one's status (done steps checked, the in-progress step noted); it only
@@ -1846,12 +2379,13 @@ model the router selected for that agent pulled.
   If your server listens elsewhere, set `myDevTeam.ollama.endpoint`; the
   activation health check will tell you if the endpoint or a routed model is
   missing.
-- **Cloud models (optional).** To use OpenAI, Anthropic, or Groq models, export
-  the key as the `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `GROQ_API_KEY`
-  environment variable in the environment VS Code launches from (or, when using
+- **Cloud models (optional).** To use OpenAI, Anthropic, Groq, DeepSeek, or Z.AI models, export
+  the key as the `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `GROQ_API_KEY` / `DEEPSEEK_API_KEY` /
+  `ZAI_API_KEY` environment variable in the environment VS Code launches from (or, when using
   the local engine, store it with the "My Dev Team: Set API Key" command). For
   Azure or another gateway, point `myDevTeam.openai.baseUrl` /
-  `myDevTeam.anthropic.baseUrl` / `myDevTeam.groq.baseUrl` at it. Then pick the
+  `myDevTeam.anthropic.baseUrl` / `myDevTeam.groq.baseUrl` / `myDevTeam.deepseek.baseUrl` /
+  `myDevTeam.zai.baseUrl` at it. Then pick the
   model with `/model`; with no key set, those models show as unavailable and
   `Auto` stays on Ollama.
 
@@ -1908,6 +2442,12 @@ one-route-per-file structure.
 | `npm test`              | Run the Vitest unit suite once                                  |
 | `npm run test:watch`    | Vitest in watch mode                                            |
 | `npm run test:coverage` | Run the suite with a v8 coverage report                        |
+
+A committed pre-commit hook (`.githooks/pre-commit`) guards the generated
+model catalogue: it fails the commit when `engine/config/models/*.md` has
+drifted from the shared registry in the sibling `my-dev-team-config` checkout
+(and skips silently when that checkout is absent). Activate it once per clone
+with `git config core.hooksPath .githooks`.
 
 ### Tests
 

@@ -5,11 +5,11 @@
  * vice versa. It imports no `vscode` (the whole point of the runtime-config and
  * env-only-secrets work), so it runs in a plain Node child.
  *
- * The inversions are wired here: the run's `ToolHost` is a proxy that posts a
- * `tool-call` and resolves when the parent answers with a `tool-result`, and the
- * `reviewPlan` seam posts a `plan-review` and resolves on the `plan-decision` -
- * so an engine running in the child can only ever *ask* the client to touch the
- * workspace or approve a plan, exactly as in-process.
+ * The inversion is wired here: the run's `ClientHost` is a proxy that posts an
+ * `invoke` and resolves when the parent answers with an `invoke-result`, for
+ * every capability - a tool, a plan review, a check-in, a clarify, a skill body
+ * - so an engine running in the child can only ever *ask* the client, named by
+ * capability, exactly as in-process.
  */
 import {
   Engine,
@@ -18,9 +18,15 @@ import {
   RunFailedError,
   RunCancelledError,
 } from '../protocol/engine';
-import { ToolHost } from '../protocol/toolContract';
-import { RunRequest, PlanDecision, PROTOCOL_VERSION } from '../protocol/types';
+import {
+  ClientHost,
+  CapabilityName,
+  CapabilityPayload,
+  CapabilityResult,
+} from '../protocol/capabilities';
+import { RunRequest, PROTOCOL_VERSION } from '../protocol/types';
 import { setRuntimeConfig } from '../config/runtimeConfig';
+import { setDebugSink } from '../config/debugLog';
 import { ParentMessage, ChildMessage, RunResult } from './transport';
 
 function errorMessage(err: unknown): string {
@@ -49,6 +55,11 @@ export function createChildRuntime(
   makeEngine: () => Engine
 ): (msg: ParentMessage) => void {
   const engine = makeEngine();
+  // Route the engine's debug entries (its provider-API traffic) to the parent,
+  // which writes them to the "My Dev Team (Debug)" output channel. The engine
+  // only emits when `myDevTeam.debug` is on (it gates on the injected runtime
+  // config), so this posts nothing in the common case.
+  setDebugSink({ write: (entry) => post({ t: 'debug', entry }) });
   // The readiness handshake: tell the parent the engine is up, which protocol it
   // speaks, and its kind. Deferred to a microtask so the parent (which subscribes
   // to messages as it constructs its channel) has its handler in place first -
@@ -58,76 +69,70 @@ export function createChildRuntime(
     post({ t: 'ready', protocolVersion: PROTOCOL_VERSION, kind: engine.kind })
   );
   const runs = new Map<string, RunHandle>();
-  // Each pending inversion remembers its `runId` so a run that settles (or whose
-  // parent answer never arrives) can clean up the promises it left waiting,
-  // rather than leaking them.
-  const toolCalls = new Map<
+  // Each pending invoke remembers its `runId` so a run that settles (or whose
+  // parent answer never arrives) can reject the promise it left waiting rather
+  // than leaking it. One map for every capability, keyed by the call's id.
+  const invokes = new Map<
     string,
-    { runId: string; resolve: (result: string) => void; reject: (err: Error) => void }
-  >();
-  const planReviews = new Map<
-    string,
-    { runId: string; resolve: (decision: PlanDecision) => void }
+    { runId: string; resolve: (result: unknown) => void; reject: (err: Error) => void }
   >();
   let callSeq = 0;
-  let reviewSeq = 0;
 
   /**
-   * Settle a run: forget its handle and reject any tool call still awaiting a
-   * `tool-result` (the parent already settled the run, so no answer is coming),
-   * and drop any pending plan review so its resolver does not leak.
+   * Settle a run: forget its handle and reject any invoke still awaiting an
+   * `invoke-result` (the parent already settled the run, so no answer is coming),
+   * so no resolver leaks.
    */
   function settleRun(runId: string): void {
     runs.delete(runId);
-    for (const [callId, pending] of toolCalls) {
+    for (const [callId, pending] of invokes) {
       if (pending.runId === runId) {
-        toolCalls.delete(callId);
+        invokes.delete(callId);
         pending.reject(new RunCancelledError());
-      }
-    }
-    for (const [reviewId, pending] of planReviews) {
-      if (pending.runId === runId) {
-        planReviews.delete(reviewId);
       }
     }
   }
 
-  function startRun(runId: string, request: RunRequest, canReviewPlan: boolean): void {
-    const toolHost: ToolHost = {
-      tools: request.offeredTools,
-      execute: (tool, args, signal) =>
-        new Promise<string>((resolve, reject) => {
-          const callId = `${runId}#${callSeq++}`;
-          toolCalls.set(callId, { runId, resolve, reject });
-          if (signal) {
-            const onAbort = () => {
-              if (toolCalls.delete(callId)) {
-                reject(signal.reason instanceof Error ? signal.reason : new Error('Aborted'));
-              }
-            };
-            if (signal.aborted) {
-              onAbort();
-              return;
+  function startRun(
+    runId: string,
+    request: RunRequest,
+    capabilities: CapabilityName[]
+  ): void {
+    // The proxy host: every capability posts an `invoke` and resolves on the
+    // matching `invoke-result`. The signal (only `tool` carries one) lets a
+    // cancelled run abort the awaiting promise.
+    function invoke<K extends CapabilityName>(
+      capability: K,
+      payload: CapabilityPayload<K>,
+      signal?: AbortSignal
+    ): Promise<CapabilityResult<K>> {
+      return new Promise<CapabilityResult<K>>((resolve, reject) => {
+        const callId = `${runId}#${callSeq++}`;
+        invokes.set(callId, {
+          runId,
+          resolve: (result) => resolve(result as CapabilityResult<K>),
+          reject,
+        });
+        if (signal) {
+          const onAbort = () => {
+            if (invokes.delete(callId)) {
+              reject(signal.reason instanceof Error ? signal.reason : new Error('Aborted'));
             }
-            signal.addEventListener('abort', onAbort, { once: true });
+          };
+          if (signal.aborted) {
+            onAbort();
+            return;
           }
-          post({ t: 'tool-call', runId, callId, tool, args });
-        }),
-    };
+          signal.addEventListener('abort', onAbort, { once: true });
+        }
+        post({ t: 'invoke', runId, callId, capability, payload });
+      });
+    }
 
+    const host: ClientHost = { tools: request.offeredTools, capabilities, invoke };
     const client: RunClient = {
       onEvent: (event) => post({ t: 'event', runId, event }),
-      toolHost,
-      ...(canReviewPlan
-        ? {
-            reviewPlan: (plan, complexity) =>
-              new Promise<PlanDecision>((resolve) => {
-                const reviewId = `${runId}~${reviewSeq++}`;
-                planReviews.set(reviewId, { runId, resolve });
-                post({ t: 'plan-review', runId, reviewId, plan, complexity });
-              }),
-          }
-        : {}),
+      ...host,
     };
 
     let handle: RunHandle;
@@ -157,29 +162,21 @@ export function createChildRuntime(
         setRuntimeConfig(msg.config);
         return;
       case 'start':
-        startRun(msg.runId, msg.request, msg.canReviewPlan);
+        startRun(msg.runId, msg.request, msg.capabilities);
         return;
       case 'cancel':
         runs.get(msg.runId)?.cancel();
         return;
-      case 'tool-result': {
-        const pending = toolCalls.get(msg.callId);
+      case 'invoke-result': {
+        const pending = invokes.get(msg.callId);
         if (!pending) {
           return;
         }
-        toolCalls.delete(msg.callId);
+        invokes.delete(msg.callId);
         if (msg.ok) {
           pending.resolve(msg.result);
         } else {
           pending.reject(new Error(msg.error));
-        }
-        return;
-      }
-      case 'plan-decision': {
-        const pending = planReviews.get(msg.reviewId);
-        if (pending) {
-          planReviews.delete(msg.reviewId);
-          pending.resolve(msg.decision);
         }
         return;
       }

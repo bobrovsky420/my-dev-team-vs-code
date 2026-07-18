@@ -3,6 +3,7 @@ import { resolveModel, routeModel } from './models';
 import { resolveTokenCounts, UsageReporter } from './usage';
 import { condenseThinking } from './thinking';
 import { agents } from '../config/agents';
+import { withSteering } from '../config/steering';
 import { limits } from '../../config/limits';
 import type { ThinkingProgress } from './executor';
 
@@ -29,12 +30,13 @@ export class Answerer {
    * Answerer per run with the run request's choice.
    */
   constructor(modelPin?: string) {
-    this.modelName = routeModel(agents.answerer.capabilities, modelPin).model;
+    const routed = routeModel(agents.answerer.capabilities, modelPin);
+    this.modelName = routed.model;
     this.agent = new Agent({
       id: agents.answerer.id,
       name: agents.answerer.name,
       description: agents.answerer.description,
-      instructions: agents.answerer.instructions,
+      instructions: withSteering(agents.answerer.instructions, routed),
       model: resolveModel(agents.answerer.capabilities, modelPin),
     });
   }
@@ -45,7 +47,9 @@ export class Answerer {
     onUsage?: UsageReporter,
     onThinking?: ThinkingProgress
   ): Promise<string> {
-    const output = await this.agent.stream([{ role: 'user', content: prompt }]);
+    const output = await this.agent.stream([{ role: 'user', content: prompt }], {
+      modelSettings: agents.answerer.modelSettings,
+    });
     // The full chunk stream so a reasoning model's `<think>` output can be
     // split from the answer: `text-delta` chunks accumulate into the answer
     // snapshots, `reasoning` chunks feed the (ephemeral) thinking sink and are

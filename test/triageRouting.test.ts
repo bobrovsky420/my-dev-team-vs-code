@@ -104,6 +104,35 @@ describe('triageRouting', () => {
     expect(triageRouting().candidates.every((m) => m.provider === 'anthropic')).toBe(true);
   });
 
+  it('cascades to the work model when triage.model is unset', () => {
+    // The user picked a cloud provider for the work agents and set no triage
+    // model: triage follows the work model rather than the local backend floor,
+    // so a box with no Ollama server still routes triage successfully.
+    __setConfig('myDevTeam.model', 'provider:anthropic');
+    const { pin, candidates } = triageRouting();
+    expect(pin).toBeUndefined();
+    expect(candidates.every((m) => m.provider === 'anthropic')).toBe(true);
+    expect(routeTriageModel(agents.triage.capabilities).provider).toBe('anthropic');
+  });
+
+  it('cascades a concrete work model id to triage when triage.model is unset', () => {
+    __setConfig('myDevTeam.model', 'anthropic-opus');
+    expect(triageRouting().pin).toBe('anthropic-opus');
+  });
+
+  it('keeps the backend floor when the work model is "auto"', () => {
+    // The default work model is "auto", which names no provider, so triage stays
+    // on the cheap local backend floor rather than cascading.
+    __setConfig('myDevTeam.model', 'auto');
+    expect(triageRouting().candidates.every((m) => m.provider === 'ollama')).toBe(true);
+  });
+
+  it('lets an explicit triage.model win over the work model', () => {
+    __setConfig('myDevTeam.model', 'provider:anthropic');
+    __setConfig('myDevTeam.triage.model', 'provider:llamacpp');
+    expect(triageRouting().candidates.every((m) => m.provider === 'llamacpp')).toBe(true);
+  });
+
   it('cannot select a user provider the build disabled', () => {
     fakeBackend.models.disabledProviders = ['anthropic'];
     __setConfig('myDevTeam.triage.model', 'provider:anthropic');

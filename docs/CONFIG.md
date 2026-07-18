@@ -72,37 +72,53 @@ so consumers can always trust what they read.
 | Setting | Default | Usage | Floor / layer interaction |
 | ------- | ------- | ----- | ------------------------- |
 | `engine` | `local` | Which engine handles runs: `local` (in-process), `sidecar` (same engine in a forked child), or `remote` (Phase B; warns and falls back to local) | - |
-| `model` | `auto` | Planner/answerer/executor model: a model id, `provider:<name>`, or `auto`. Set via `/model` or the status-bar menu; picking a provider/Auto there also sets `triage.model` to match | - |
-| `triage.model` | `""` | Triage classifier model, separate from `model`. Empty defers to the floor. Set from `/model`'s "Triage only" group, by a provider/Auto pick (which sets both), or directly | empty -> `agents.triage.model` floor |
-| `complexityRouting` | `true` | Size the model to the task's complexity tier; off routes by capability alone | a model pin bypasses regardless |
-| `planApproval` | `auto` | When a drafted plan must be approved: `auto` (only when complex), `always`, `never` | - |
+| `model` | `auto` | Planner/answerer/executor model: a model id, `provider:<name>`, or `auto`. Set via `/model` or the status-bar menu; picking a provider/Auto there also sets `triage.model` to match. Also read by the engine (via the runtime-config seam) as triage's default and for the startup probe | - |
+| `triage.model` | `""` | Triage classifier model, separate from `model`. Empty cascades to `model` (when it names a concrete model/provider), then the floor. Set from `/model`'s "Triage only" group, by a provider/Auto pick (which sets both), or directly. Ignored in `combined` triage mode | empty -> `model` (if concrete) -> `agents.triage.model` floor |
+| `triage.mode` | `classifier` | How a request is routed: `classifier` (triage call, then answerer/planner) or `combined` (one responder triages + answers-or-plans in a single call on the `model` work model). Only the unpinned path is affected - a slash command still pins the route and uses the dedicated agents | - |
+| `complexityRouting` | `true` | Size the model to the task's complexity tier; off routes by capability alone. In `combined` mode the responder is not complexity-sized; the executor still is | a model pin bypasses regardless |
+| `planApproval` | `auto` | When a drafted plan must be approved: `auto` (only when complex), `always`, `never`. On `always`, a `direct`-route change is escalated to a drafted plan so there is something to approve | - |
 | `planApproval.preview` | `auto` | When a paused plan also opens as a read-only editor preview: `auto` (only a big plan), `always`, `never` (chat only) | client-only (not on the engine runtime-config seam); applies only when `planApproval` pauses |
-| `verbosity` | `verbose` | How much each reply renders: `verbose` (intent + reason + complexity + full plan with step details) or `default` (intent only; plan summary + step titles). Set via `/verbose`, "Select Output Mode", or the status-bar menu | client-only (not on the engine runtime-config seam); a pure rendering choice, the full reply data crosses the protocol either way |
+| `verbosity` | `verbose` | How much each reply renders: `verbose` (intent + reason + complexity + full plan with step details + every built-in tool call's output) or `default` (intent only; plan summary + step titles; a tool call shows only the tool name and its key argument, a failed call still surfaces its error, dynamic/MCP tools are not gated). Set via `/verbose`, "Select Output Mode", or the status-bar menu | client-only (not on the engine runtime-config seam); a pure rendering choice, the full reply data crosses the protocol either way |
+| `attachActiveEditor` | `true` | Auto-attach the open file (or just the selection when text is selected) as context on every request, so "the current file"/"this selection" resolves without the user attaching anything | client-only (not on the engine runtime-config seam); de-duped against an explicitly-attached/implicit reference to the same file |
 | `approval.fileChanges` | `false` | Gate `write`/`edit` behind approval like `run`; off applies changes directly | `run` stays gated regardless |
 | `disabledProviders` | `[]` | Providers the router must never use | **union** with floor; cannot re-enable a floor-disabled provider |
 | `disabledModels` | `[]` | Model ids the router must never use | **union** with floor |
+| `customModels` | `[]` | Extra model definitions merged on top of the built-in registry (each: `id`, `label`, `provider`, `model`, optional `tier`/`capabilities`/`description`) | **add-only**: each must name an already-wired provider; an id colliding with a built-in (or an earlier entry) is dropped, never overrides |
 | `ollama.endpoint` | `""` (unset) | Ollama server origin (no `/api` suffix) | **user wins** over `providers.ollama.endpoint` default; unset -> deployment default -> built-in localhost |
 | `llamacpp.endpoint` | `""` (unset) | llama.cpp (`llama-server`) origin (no `/v1` suffix); keyless local provider | **user wins** over `providers.llamacpp.endpoint` default; unset -> deployment default -> built-in `http://localhost:8080` |
 | `openai.baseUrl` | `""` | OpenAI / Azure / compatible gateway base URL | **user wins** over `providers.openai.baseUrl` default; unset -> deployment default -> SDK default |
 | `anthropic.baseUrl` | `""` | Anthropic proxy/gateway base URL | **user wins** over backend default |
 | `groq.baseUrl` | `""` | Groq proxy/gateway base URL | **user wins** over backend default |
+| `deepseek.baseUrl` | `""` | DeepSeek proxy/gateway base URL | **user wins** over backend default |
+| `zai.baseUrl` | `""` | Z.AI (GLM) proxy/gateway base URL | **user wins** over backend default; unset -> deployment default -> Z.AI default (`https://api.z.ai/api/paas/v4`) |
 | `provider.requestsPerMinute` | `null` (unset) | Override of the per-provider request rate; `0` disables throttling, `N` sets N/min | **user wins** over the backend per-provider default (either direction); unset defers to it |
 | `run.commandTimeoutMs` | `60000` | `run` tool shell-command timeout (ms) | - |
+| `run.allowedCommands` | `[]` | Command prefixes/globs the `run` tool runs without an approval prompt (e.g. `git status`, `npm test`, `npm run *`) | only a single, non-chained command matches; a denylisted command never matches; the "Always allow commands like this" choice appends here; invalid entries dropped |
+| `run.deniedCommands` | `[]` | Extra command patterns that always prompt and are treated as destructive | **unioned with** a non-removable built-in floor - POSIX (`rm`, `git push`, `git reset`, `git clean/checkout/rebase`, `curl`, `wget`, ...) and PowerShell (`Remove-Item`, `Clear-Content`, `Stop-Process`, `Stop-Computer`, `Format-Volume`, `Invoke-Expression`, ...); overrides the agent's `dangerous` flag and any `run` Allow-All grant; case-insensitive; scans each chained segment |
 | `read.maxLines` | `200` | Max lines one `read` call returns | - |
 | `search.globMaxResults` | `200` | Max files a glob search returns | - |
 | `search.contentScanLimit` | `500` | Max files a content search scans | - |
 | `search.contentMaxMatches` | `50` | Max match lines before a content search stops | - |
 | `chat.toolSnippetLines` | `5` | Leading lines of a write/edit shown in the transcript (`0` hides) | - |
+| `executor.checkpointEverySteps` | `100` | Steps between executor/planner check-ins ("keep going or stop?"); `0` turns the step trigger off | the planner now drives a tool-calling loop too and shares this; whichever of steps/seconds is reached first triggers it; must be `< executor.maxSteps` to fire |
+| `executor.checkpointEverySeconds` | `600` | Seconds between executor/planner check-ins; `0` turns the time trigger off | shared by the planner's loop; whichever of steps/seconds is reached first triggers it |
+| `executor.contextWarnThresholds` | `[75, 85, 95]` | Context-usage levels (% of the model's window) that each warn once during an executor or planner run; each level below `history.autoCompactThreshold` also offers a "Compact now" action | cleaned to whole percents in (0,100], de-duped, sorted; empty/all-invalid -> default |
+| `history.autoCompact` | `true` | Auto-compact the conversation once a run crosses `history.autoCompactThreshold`: the next message runs `/compact` first and continues against the summary | client-only (history is client state); anything but literal `false` is on |
+| `history.autoCompactThreshold` | `95` | Context-usage level (% of the model's window) at/above which the conversation auto-compacts on the next message (when `history.autoCompact` is on); below it a warning only offers "Compact now" | cleaned to a whole percent in (0,100]; unset/invalid -> default; set it to one of `executor.contextWarnThresholds` to line up with a warning |
+| `modelContextWindows` | `{}` | Per-model context-window sizes in tokens keyed by model id, e.g. `{"qwen3-coder": 32768}` | overrides the model's built-in `contextWindow`; matters most for local models (real `num_ctx`); only positive whole numbers kept |
 | `write.protectedPaths` | `[".vscode"]` | Root-relative paths `write`/`edit` refuse to touch | `.git/` is always protected and not removable; `..` entries -> default |
 | `usage.showInChat` | `true` | Append a `Tokens:` line under each reply | status-bar total and report are independent |
 | `changes.showInChat` | `true` | Append a `Changes:` line when a turn wrote files | - |
 | `summary.showInChat` | `true` | Three-section summary after a file-changing run | off skips the summarizer model call entirely |
-| `thinking.showInChat` | `true` | Show a reasoning model's thinking as transient progress | off skips capturing reasoning entirely |
+| `thinking.showInChat` | `true` | Capture a reasoning model's thinking so its duration can be timed (the live indicator is VS Code's own built-in progress, shown either way) | off skips capturing reasoning entirely, and removes the duration line |
+| `thinking.showDuration` | `true` | Append a `Thought for Ns` line after a reasoning model finishes | client-only; needs `thinking.showInChat` on to have timed anything; anything but `false` counts as on |
+| `clarify.enabled` | `true` | Let the engine end an ambiguous run by asking the user (the "clarify" route) instead of guessing | off coerces a clarify decision to a normal answer, so a run always produces work; anything but `false` counts as on |
 | `instructions.files` | `["AGENTS.md", "CLAUDE.md"]` | Root-relative instruction file names probed in order | plain names only; a `/` or `..` entry -> default list |
 | `skills.directories` | `[".devteam/skills", ".claude/skills"]` | Dirs scanned for `<dir>/<name>/SKILL.md` (workspace roots + home) | absolute or `..` entry -> default list |
 | `mcp.servers` | `{}` | stdio MCP servers: name -> `{ command, args?, env? }` | ignored in an untrusted workspace; invalid entries dropped |
 | `telemetry.evalLog` | `false` | Opt-in local eval log of run/feedback records | nothing leaves the machine |
 | `telemetry.shadowTriage` | `false` | Also run triage on pinned runs to score it | only collects while `evalLog` is on |
+| `debug` | `false` | Log every layer of a run (client<->backend protocol + each provider-API call's raw request/response) to the "My Dev Team (Debug)" output channel | read live; works for the local and sidecar engine; diagnostic only - verbose, carries the run's raw content, stays on the machine; anything but literal `true` is off |
 
 ## 2. Operator config (`backend.json`)
 
@@ -125,8 +141,10 @@ which is which.
 | `providers.openai.baseUrl` | `""` | OpenAI base URL **default** | user `myDevTeam.openai.baseUrl` **wins** when set |
 | `providers.anthropic.baseUrl` | `""` | Anthropic base URL **default** | user `myDevTeam.anthropic.baseUrl` **wins** when set |
 | `providers.groq.baseUrl` | `""` | Groq base URL **default** | user `myDevTeam.groq.baseUrl` **wins** when set |
+| `providers.deepseek.baseUrl` | `""` | DeepSeek base URL **default** | user `myDevTeam.deepseek.baseUrl` **wins** when set |
+| `providers.zai.baseUrl` | `""` | Z.AI base URL **default** | user `myDevTeam.zai.baseUrl` **wins** when set; unset -> Z.AI default endpoint |
 | `providers.<id>.requestsPerMinute` | `0` (per provider) | Per-provider request-rate **default** (requests/min; `0` = no throttle) | user `myDevTeam.provider.requestsPerMinute` **wins** when set (either direction); unset defers to it |
-| `agents.triage.model` | `"ollama"` | Triage routing **default**: a model id pins it, a provider name routes by capability | user `triage.model` **wins** when set |
+| `agents.triage.model` | `"ollama"` | Triage routing **default**, used only when both `triage.model` and the work `model` are unset/`auto`: a model id pins it, a provider name routes by capability | user `triage.model` **wins** when set, then the work `model` when it names a concrete model/provider |
 
 ## 3. Secrets (API keys)
 
@@ -147,6 +165,8 @@ a cloud provider is any non-keyless descriptor. Read live by the provider wiring
 | `openai` | `OPENAI_API_KEY` | `myDevTeam.openai.apiKey` |
 | `anthropic` | `ANTHROPIC_API_KEY` | `myDevTeam.anthropic.apiKey` |
 | `groq` | `GROQ_API_KEY` | `myDevTeam.groq.apiKey` |
+| `deepseek` | `DEEPSEEK_API_KEY` | `myDevTeam.deepseek.apiKey` |
+| `zai` | `ZAI_API_KEY` | `myDevTeam.zai.apiKey` |
 | `ollama` | - (keyless, local) | - |
 | `llamacpp` | - (keyless, local) | - |
 
@@ -178,14 +198,16 @@ code and rebuild. They bound how much work the tools and UI do.
 | | `search.maxFileSizeBytes` | `1 MB` |
 | | `search.scanCandidateLimit` | `25000` |
 | Structured output | `structuredOutput.repairAttempts` | `1` |
-| Executor | `executor.maxSteps` | `12` |
+| Executor | `executor.maxSteps` | `1000` (the runaway-step ceiling shared by the executor and the planner loops) |
 | | `executor.inputPreviewMaxChars` | `200` |
 | | `executor.resultPreviewMaxChars` | `400` |
 | Thinking | `thinking.lineMaxChars` | `200` |
+| Compaction | `compaction.inputWindowFraction` | `0.6` (fraction of the compacter model's window the conversation may fill per pass) |
+| | `compaction.briefingReserveFraction` | `0.4` (per-pass budget reserved for the carried briefing in a multi-pass refine) |
 | Telemetry | `telemetry.evalLogMaxChars` | `1000000` |
 | Instructions | `instructions.maxChars` | `8000` |
 | Skills | `skills.maxSkills` | `24` |
-| | `skills.maxChars` | `8000` |
+| | `skills.maxChars` | `8000` (caps each skill body the client serves on demand) |
 | MCP | `mcp.maxTools` | `64` |
 | | `mcp.connectTimeoutMs` | `10000` |
 | | `mcp.callTimeoutMs` | `60000` |
@@ -200,6 +222,8 @@ code and rebuild. They bound how much work the tools and UI do.
 | | `maxAttachmentReadBytes` | `10 MB` |
 | History | `history.maxTurns` | `10` |
 | | `history.maxTurnChars` | `2000` |
+| | `history.compactInputMaxChars` | `120000` (coarse client ceiling; engine does the real window-aware trim) |
+| | `history.compactSummaryMaxChars` | `8000` |
 | Startup | `startupProbeTimeoutMs` | `3000` |
 | Sidecar | `sidecar.queryTimeoutMs` | `10000` |
 | | `sidecar.readyTimeoutMs` | `10000` |
@@ -219,17 +243,20 @@ are discovered and rendered.
 
 | Folder | Per-file frontmatter |
 | ------ | -------------------- |
-| `agents/*.md` | `id`, `name`, `description`, capability weights, `tools` |
-| `models/*.md` | `id`, `label`, `provider`, `model`, `tier`, optional `triageOnly` (default `false`; `true` = eligible for triage only, not the Auto work pool - a pin still overrides), capability scores |
+| `agents/*.md` | `id`, `name`, `description`, capability weights (unified vocabulary, see `models/*.md`), `tools`, optional sampling params `temperature`/`top_p`/`top_k` (unset = provider defaults; ride each call as AI SDK `modelSettings`) |
+| `models/*.md` | `id`, `label`, `provider`, `model`, `tier`, optional `triageOnly` (default `false`; `true` = eligible for triage only, not the Auto work pool - a pin still overrides), optional `contextWindow` (tokens, for the context-usage warnings; overridable per id via `myDevTeam.modelContextWindows`), capability scores on the unified 8-name vocabulary (`reasoning`, `code-generation`, `code-analysis`, `classification`, `planning`, `fast-utility`, `structured-output`, `long-context`; the legacy `coding`/`speed` names are accepted in hand-written config and normalised). Generated from the shared `my-dev-team-config` registry (`models.yaml` + `scripts/sync_models.py`) - edit there, not here |
 | `tools/*.md` | `name`, `sideEffecting`, optional `previewArg`/`snippetArg` + description |
 | `commands/*.md` | `name`, `description`, `intent`, `execute`, optional `complexity` + preamble |
 | `skills/*.md` | `name`, `description` + instruction body |
+| `partials/*.md` | `name` + a shared prompt block; agents embed it with `{{ include <name> }}` (path and `.md` in the directive are optional). Generated from the shared `my-dev-team-config` partials library (`partials/*.md` + `scripts/sync_partials.py`) - edit there, not here |
 
 **Discovered content files** (read per request, not bundled - workspace roots
 and the user's home dir): the standing-instruction file (`AGENTS.md` /
 `CLAUDE.md`, names from `instructions.files`) and skill packages
 (`<dir>/<name>/SKILL.md`, dirs from `skills.directories`). These carry prose, not
-parameters, but the client ships them on each run request.
+parameters. The client ships the instruction file in full, but for skills it
+ships only the metadata (name + description) and serves a body on demand when the
+model loads it; the engine bundles no skills of its own.
 
 ## Precedence and merge semantics
 

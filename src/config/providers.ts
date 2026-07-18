@@ -24,6 +24,8 @@ import { createOllama } from 'ollama-ai-provider-v2';
 import { createOpenAI } from '@ai-sdk/openai';
 import { createAnthropic } from '@ai-sdk/anthropic';
 import { createGroq } from '@ai-sdk/groq';
+import { createDeepSeek } from '@ai-sdk/deepseek';
+import { createGoogleGenerativeAI } from '@ai-sdk/google';
 
 /** The AI SDK model type all providers produce. */
 export type RoutedModel = ReturnType<ReturnType<typeof createOllama>>;
@@ -118,6 +120,55 @@ const rawDescriptors = [
     build: ({ apiKey, baseUrl }: ProviderConfig) => {
       const groq = createGroq({ apiKey, ...(baseUrl ? { baseURL: baseUrl } : {}) });
       return (model: string) => groq(model) as RoutedModel;
+    },
+  },
+  {
+    id: 'deepseek',
+    label: 'DeepSeek',
+    keyless: false,
+    envKey: 'DEEPSEEK_API_KEY',
+    secretKey: 'myDevTeam.deepseek.apiKey',
+    baseUrlSetting: 'deepseek.baseUrl',
+    build: ({ apiKey, baseUrl }: ProviderConfig) => {
+      const deepseek = createDeepSeek({ apiKey, ...(baseUrl ? { baseURL: baseUrl } : {}) });
+      return (model: string) => deepseek(model) as RoutedModel;
+    },
+  },
+  {
+    id: 'zai',
+    label: 'Z.AI',
+    keyless: false,
+    envKey: 'ZAI_API_KEY',
+    secretKey: 'myDevTeam.zai.apiKey',
+    baseUrlSetting: 'zai.baseUrl',
+    build: ({ apiKey, baseUrl }: ProviderConfig) => {
+      // Z.AI (the GLM models) serves an OpenAI-compatible API, so it reuses the
+      // OpenAI SDK rather than its own `@ai-sdk/*` package - but it is not OpenAI,
+      // so unlike the `openai` provider it has no SDK-default endpoint: the base
+      // URL falls back to Z.AI's published one when neither the user nor the
+      // deployment sets an override. Use the Chat Completions transport (`.chat`),
+      // not the Responses API the cloud OpenAI provider defaults to, since the
+      // Z.AI endpoint only implements `/chat/completions`.
+      const openai = createOpenAI({
+        apiKey,
+        baseURL: baseUrl ?? 'https://api.z.ai/api/paas/v4',
+      });
+      return (model: string) => openai.chat(model) as RoutedModel;
+    },
+  },
+  {
+    id: 'google',
+    label: 'Google',
+    keyless: false,
+    // The AI SDK's Google (Gemini) provider reads this env var by default; we
+    // pass the resolved key explicitly anyway, but keep the name so a user who
+    // already has GOOGLE_GENERATIVE_AI_API_KEY set needs no extra config.
+    envKey: 'GOOGLE_GENERATIVE_AI_API_KEY',
+    secretKey: 'myDevTeam.google.apiKey',
+    baseUrlSetting: 'google.baseUrl',
+    build: ({ apiKey, baseUrl }: ProviderConfig) => {
+      const google = createGoogleGenerativeAI({ apiKey, ...(baseUrl ? { baseURL: baseUrl } : {}) });
+      return (model: string) => google(model) as RoutedModel;
     },
   },
 ] as const;

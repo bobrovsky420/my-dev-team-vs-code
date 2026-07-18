@@ -1,9 +1,16 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { collectReferences } from '../src/client/references';
+import {
+  collectReferences,
+  buildGitDiff,
+  isMaxBufferError,
+} from '../src/client/references';
+import { messages } from '../src/config/messages';
 import { settings } from '../src/config/settings';
 import {
   __reset,
   __state,
+  __setActiveEditor,
+  __setConfig,
   __setFile,
   Uri,
   Location,
@@ -103,6 +110,82 @@ describe('collectReferences - explicit references', () => {
   });
 });
 
+describe('collectReferences - active editor (implicit context)', () => {
+  /** A fake active editor reading from in-memory text, like a real TextEditor. */
+  function fakeEditor(uri: Uri, text: string, selection?: Range) {
+    return {
+      document: {
+        uri,
+        getText: (range?: Range) =>
+          range
+            ? text.split('\n').slice(range.start.line, range.end.line + 1).join('\n')
+            : text,
+      },
+      // Default to an empty selection (caret only): start === end.
+      selection: selection ?? new Range(new Position(0, 0), new Position(0, 0)),
+    };
+  }
+
+  it('attaches the whole open file when nothing is selected', async () => {
+    const uri = __setFile('src/open.ts', 'line0\nline1\nline2');
+    __setActiveEditor(fakeEditor(uri, 'line0\nline1\nline2'));
+
+    const { attachments } = await collectReferences([], 'analyse the current file', noDiff);
+
+    expect(attachments).toEqual([
+      { label: 'Active file: src/open.ts', text: 'line0\nline1\nline2' },
+    ]);
+  });
+
+  it('attaches only the selection when text is selected', async () => {
+    const uri = __setFile('src/open.ts', 'l0\nl1\nl2\nl3');
+    __setActiveEditor(
+      fakeEditor(uri, 'l0\nl1\nl2\nl3', new Range(new Position(1, 0), new Position(2, 2)))
+    );
+
+    const { attachments } = await collectReferences([], 'explain this', noDiff);
+
+    expect(attachments).toHaveLength(1);
+    expect(attachments[0].label).toBe('Active selection in src/open.ts (lines 2-3)');
+    expect(attachments[0].text).toBe('l1\nl2');
+  });
+
+  it('does not attach when the setting is off', async () => {
+    __setConfig('myDevTeam.attachActiveEditor', false);
+    const uri = __setFile('src/open.ts', 'body');
+    __setActiveEditor(fakeEditor(uri, 'body'));
+
+    const { attachments } = await collectReferences([], 'hello', noDiff);
+
+    expect(attachments).toEqual([]);
+  });
+
+  it('does not duplicate a file already attached explicitly', async () => {
+    const uri = __setFile('src/open.ts', 'file body');
+    __setActiveEditor(fakeEditor(uri, 'file body'));
+
+    // The same file arrives as an explicit Uri reference (e.g. the user attached
+    // it, or VS Code sent its implicit current-file reference).
+    const { attachments } = await collectReferences([{ value: uri } as any], 'q', noDiff);
+
+    expect(attachments).toEqual([{ label: 'File: src/open.ts', text: 'file body' }]);
+  });
+
+  it('attaches the active file alongside an explicit reference to a different file', async () => {
+    const attached = __setFile('src/other.ts', 'other body');
+    const openUri = __setFile('src/open.ts', 'open body');
+    __setActiveEditor(fakeEditor(openUri, 'open body'));
+
+    const { attachments } = await collectReferences([{ value: attached } as any], 'q', noDiff);
+
+    // Explicit reference leads; the active file trails as implicit context.
+    expect(attachments).toEqual([
+      { label: 'File: src/other.ts', text: 'other body' },
+      { label: 'Active file: src/open.ts', text: 'open body' },
+    ]);
+  });
+});
+
 describe('collectReferences - #changes', () => {
   it('attaches the git diff and strips the marker from the prompt', async () => {
     const gitDiff = async () => '# Unstaged changes\ndiff --git a/x b/x';
@@ -129,6 +212,50 @@ describe('collectReferences - #changes', () => {
     __state.workspaceFolders = undefined;
     const { attachments } = await collectReferences([], '#changes', async () => 'should be ignored');
     expect(attachments[0].text).toContain('not available');
+  });
+});
+
+describe('isMaxBufferError', () => {
+  it('recognises the stdout overflow by code or message', () => {
+    expect(isMaxBufferError({ code: 'ERR_CHILD_PROCESS_STDOUT_MAXBUFFER' })).toBe(true);
+    expect(isMaxBufferError(new Error('stdout maxBuffer length exceeded'))).toBe(true);
+  });
+
+  it('does not flag an ordinary git failure', () => {
+    expect(isMaxBufferError(new Error('not a git repository'))).toBe(false);
+    expect(isMaxBufferError(undefined)).toBe(false);
+  });
+});
+
+describe('buildGitDiff (B-2: large diff is not misreported as empty)', () => {
+  it('combines staged and unstaged diffs', async () => {
+    const run = async (args: string[]) => ({
+      out: args.includes('--staged') ? 'S' : 'U',
+      overflow: false,
+    });
+    const text = await buildGitDiff(run);
+    expect(text).toBe('# Staged changes\nS\n\n# Unstaged changes\nU');
+  });
+
+  it('falls back to a --stat summary with a notice when the diff overflows', async () => {
+    // The full `diff`/`diff --staged` overflow; the `--stat` variants are small.
+    const run = async (args: string[]) => {
+      if (args.includes('--stat')) {
+        return { out: args.includes('--staged') ? ' a | 2 +-' : ' b | 9 +++', overflow: false };
+      }
+      return { out: '', overflow: true };
+    };
+    const text = await buildGitDiff(run);
+    expect(text).toContain(messages.references.changesTooLarge);
+    expect(text).toContain('# Unstaged changes (summary)');
+    expect(text).toContain('b | 9 +++');
+    // Crucially, it is not the empty string the bug produced.
+    expect(text.trim().length).toBeGreaterThan(0);
+  });
+
+  it('reports a genuinely clean tree (and non-overflow failures) as empty', async () => {
+    const run = async () => ({ out: '', overflow: false });
+    expect(await buildGitDiff(run)).toBe('');
   });
 });
 

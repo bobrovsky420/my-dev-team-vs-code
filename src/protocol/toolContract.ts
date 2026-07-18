@@ -3,22 +3,22 @@
  * identity of the workspace tools the client offers an engine.
  *
  * The split mirrors the trust boundary. The client owns the implementations
- * (src/tools/) plus everything user-facing about a tool - its editor-wide
- * Language Model Tools id and the display name transcripts render. The engine
- * owns everything model-facing - the descriptions its prompts carry and the
+ * (src/tools/) plus the display name transcripts render; the engine owns
+ * everything model-facing - the descriptions its prompts carry and the
  * preview/snippet rendering hints (src/engine/config/tools/*.md). This module
  * is what both sides must agree on for a call to cross the boundary: which
  * tools exist and what arguments they take.
  *
- * The input schemas deliberately match the package.json
- * `contributes.languageModelTools` declarations; their describe() strings are
- * the argument documentation both surfaces show a model.
+ * These tools are private to `@devteam`: they are not contributed as editor-wide
+ * Language Model Tools (no `package.json` `contributes.languageModelTools`, no
+ * `vscode.lm.registerTool`), so no other chat model in the editor can call them.
+ * The engine reaches them only through the run's `ClientHost` (`tool` capability).
+ * Their describe() strings are the argument documentation the model sees.
  */
 import { z } from 'zod';
 
 export const clientTools = {
   read: {
-    lmToolId: 'devteam__read',
     displayName: 'Read File',
     inputSchema: z.object({
       path: z.string().describe('Workspace-relative path of the file to read.'),
@@ -40,7 +40,6 @@ export const clientTools = {
     }),
   },
   search: {
-    lmToolId: 'devteam__search',
     displayName: 'Search Files',
     inputSchema: z.object({
       query: z
@@ -54,14 +53,24 @@ export const clientTools = {
     }),
   },
   run: {
-    lmToolId: 'devteam__run',
     displayName: 'Run Command',
     inputSchema: z.object({
       command: z.string().describe('The shell command to execute.'),
+      dangerous: z
+        .boolean()
+        .optional()
+        .describe(
+          'Set to true when the command is destructive or irreversible - it ' +
+            'deletes or overwrites files, rewrites or force-pushes history, ' +
+            'resets working state, drops data, or otherwise cannot be easily ' +
+            'undone (e.g. rm -rf, git reset --hard, git push --force, dropping ' +
+            'a database). The user is warned and approves such a command ' +
+            'separately from ordinary ones, so do not set it for reads, builds, ' +
+            'tests, or installs.'
+        ),
     }),
   },
   write: {
-    lmToolId: 'devteam__write',
     displayName: 'Write File',
     inputSchema: z.object({
       path: z
@@ -71,7 +80,6 @@ export const clientTools = {
     }),
   },
   edit: {
-    lmToolId: 'devteam__edit',
     displayName: 'Edit File',
     inputSchema: z.object({
       path: z
@@ -95,12 +103,28 @@ export type ClientToolName = keyof typeof clientTools;
 export const clientToolNames = Object.keys(clientTools) as ClientToolName[];
 
 /**
- * The client-side tool executor. The implementation lives in the extension
- * (it touches the user's files, shell, and approval UI) and is handed to the
- * engine with each run: the LocalEngine calls it directly, a remote engine
- * reaches it through tool-call events answered with `ToolResultMessage`s.
- * Approval is internal to the host - an engine only ever sees the returned
- * text (a declined command returns its "not approved" message, not an error).
+ * Engine-built model tools that have no static `clientTools` contract (their
+ * arguments are described engine-side) but are still *client calls*: the engine
+ * offers them to the model, and the client dispatches them by name through the
+ * `tool` capability, like a workspace tool, then composes the model-facing
+ * result string. `clarify` asks the user a focused question or two mid-draft;
+ * `skill` loads a skill's body by name. Shared here because both the engine
+ * (which builds the tool under this name) and the client (which dispatches it)
+ * must agree on the name, exactly like the `clientTools` names.
+ */
+export const CLARIFY_TOOL = 'clarify';
+export const SKILL_TOOL = 'skill';
+
+/**
+ * The client-side tool executor: the tool slice of the engine->client
+ * inversion. The implementation lives in the extension (it touches the user's
+ * files, shell, and approval UI) and backs the `tool` capability of the run's
+ * `ClientHost` (see capabilities.ts) - the LocalEngine calls it directly, a
+ * remote/sidecar engine reaches it through an `invoke` of the `tool` capability.
+ * Approval is internal to the host - an engine only ever sees the returned text
+ * (a declined command returns its "not approved" message, not an error). The
+ * engine-side `HostFacade` is a `ToolHost`, so the planner/executor reach their
+ * tools through the same one inversion seam.
  */
 export interface ToolHost {
   /** Names of the tools this host implements (the run's `offeredTools`). */
@@ -119,17 +143,4 @@ export interface ToolHost {
     signal?: AbortSignal,
     correlationId?: string
   ): Promise<string>;
-}
-
-/**
- * The client's answer to a `tool-call` event (the client-to-engine half of
- * the tool round trip). Unused by the LocalEngine, which calls the ToolHost
- * in-process; defined now so the wire contract is complete.
- */
-export interface ToolResultMessage {
-  callId: string;
-  /** The tool's returned text; absent when the call threw. */
-  result?: string;
-  /** The thrown error's message; absent when the call returned. */
-  error?: string;
 }

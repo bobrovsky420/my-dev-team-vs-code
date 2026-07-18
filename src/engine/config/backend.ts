@@ -104,6 +104,12 @@ export const BackendConfigSchema = z
         anthropic: z.object({ baseUrl: endpointOverride, requestsPerMinute }).prefault({}),
         /** Groq base URL, like `myDevTeam.groq.baseUrl`. */
         groq: z.object({ baseUrl: endpointOverride, requestsPerMinute }).prefault({}),
+        /** DeepSeek base URL, like `myDevTeam.deepseek.baseUrl`. */
+        deepseek: z.object({ baseUrl: endpointOverride, requestsPerMinute }).prefault({}),
+        /** Z.AI base URL, like `myDevTeam.zai.baseUrl`. */
+        zai: z.object({ baseUrl: endpointOverride, requestsPerMinute }).prefault({}),
+        /** Google (Gemini) base URL, like `myDevTeam.google.baseUrl`. */
+        google: z.object({ baseUrl: endpointOverride, requestsPerMinute }).prefault({}),
       })
       .prefault({}),
     /** Per-agent routing config. Today only triage is configurable. */

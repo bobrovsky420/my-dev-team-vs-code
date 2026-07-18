@@ -55,6 +55,16 @@ describe('routedModels', () => {
     expect(new Set(routedModels())).toEqual(expected);
     expect(routedModels()).toHaveLength(expected.size);
   });
+
+  it('skips Ollama when the work model is pinned to a cloud provider', () => {
+    // The user picked a cloud provider for the work agents and set no triage
+    // model: the work agents route to it (pin), and triage cascades to it too, so
+    // nothing resolves to Ollama and the probe has no tags to check - even with
+    // the local provider still enabled.
+    process.env.OPENAI_API_KEY = 'sk-test';
+    __setConfig('myDevTeam.model', 'provider:openai');
+    expect(routedModels()).toHaveLength(0);
+  });
 });
 
 describe('LocalEngine.startupWarnings', () => {

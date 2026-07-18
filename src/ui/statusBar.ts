@@ -35,6 +35,10 @@ import {
   currentVerbosityLabel,
   SELECT_VERBOSITY_COMMAND_ID,
 } from './verbosityCommands';
+import {
+  currentTriageModeLabel,
+  SELECT_TRIAGE_MODE_COMMAND_ID,
+} from './triageModeCommands';
 import { SHOW_USAGE_COMMAND_ID } from './usageView';
 
 /** Command id the status-bar button fires to open its menu. */
@@ -70,6 +74,15 @@ export class StatusBar {
     this.renderTooltip();
   }
 
+  /**
+   * Redraw the hover without re-reading the catalogue, for a plain-setting change
+   * the hover reflects (e.g. `myDevTeam.debug`) where `refresh`'s model lookup is
+   * unnecessary.
+   */
+  redrawTooltip(): void {
+    this.renderTooltip();
+  }
+
   /** Re-read the catalogue and remember the current model's label for the menu. */
   async refresh(): Promise<void> {
     try {
@@ -92,7 +105,13 @@ export class StatusBar {
         model: this.modelLabel,
         tokens: formatTokenCount(this.session.totalTokens),
         estimated: this.session.hasEstimates,
+        // Read fresh each redraw: verbosity, triage mode, and the debug flag are
+        // plain settings, no live state. The debug line is shown only when on.
+        verbosity: currentVerbosityLabel(),
+        triageMode: currentTriageModeLabel(),
+        debug: settings.debug,
         selectModelCommand: SELECT_MODEL_COMMAND_ID,
+        selectTriageModeCommand: SELECT_TRIAGE_MODE_COMMAND_ID,
         usageCommand: SHOW_USAGE_COMMAND_ID,
         setKeyCommand: SET_API_KEY_COMMAND_ID,
       }),
@@ -101,6 +120,7 @@ export class StatusBar {
     tooltip.isTrusted = {
       enabledCommands: [
         SELECT_MODEL_COMMAND_ID,
+        SELECT_TRIAGE_MODE_COMMAND_ID,
         SHOW_USAGE_COMMAND_ID,
         SET_API_KEY_COMMAND_ID,
       ],
@@ -124,6 +144,11 @@ export class StatusBar {
           this.session.hasEstimates
         ),
         command: SHOW_USAGE_COMMAND_ID,
+      },
+      {
+        // Read fresh at open time: triage mode is a plain setting, no live state.
+        label: messages.status.menuTriageMode(currentTriageModeLabel()),
+        command: SELECT_TRIAGE_MODE_COMMAND_ID,
       },
       {
         // Read fresh at open time: verbosity is a plain setting, no live state.

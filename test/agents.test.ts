@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
 // Replace the Mastra Agent with a fake whose `generate`/`stream` we control,
 // so these tests never construct a real model or hit Ollama.
@@ -20,6 +20,11 @@ vi.mock('@mastra/core/agent', () => ({
 
 import { Triage, TriageSchema } from '../src/engine/core/triage';
 import { Planner, PlanSchema, PartialPlan } from '../src/engine/core/planner';
+import {
+  Responder,
+  ResponderObjectSchema,
+  ResponderProgress,
+} from '../src/engine/core/responder';
 import { Summarizer, SummaryGenSchema, PartialSummary } from '../src/engine/core/summarizer';
 import { Answerer } from '../src/engine/core/answerer';
 import { Executor, PartialExecution } from '../src/engine/core/executor';
@@ -28,6 +33,7 @@ import { agents } from '../src/engine/config/agents';
 import { routeModel, routeTriageModel } from '../src/engine/core/models';
 import { ToolHost } from '../src/protocol/toolContract';
 import { settings } from '../src/config/settings';
+import { runtimeConfig, setRuntimeConfig } from '../src/config/runtimeConfig';
 import { __state } from './mocks/vscode';
 
 beforeEach(() => {
@@ -46,6 +52,37 @@ function fakeStreamOutput(partials: unknown[], final: unknown) {
       start(controller) {
         for (const partial of partials) {
           controller.enqueue(partial);
+        }
+        controller.close();
+      },
+    }),
+    object: Promise.resolve(final),
+  };
+}
+
+/**
+ * Fake of the MastraModelOutput the planner consumes now that it drives a
+ * tool-calling loop: it drains `fullStream` (partial plans arrive as `object`
+ * chunks whose `payload.object` is the snapshot) and reads the final validated
+ * object from `output.object`. Extra chunks (e.g. `tool-call`, `reasoning-delta`)
+ * can be appended for tests that exercise exploration or thinking. Missing
+ * steps/finishReason/response/usage are tolerated (the loop runs one batch and
+ * finishes naturally), so they are left off.
+ */
+function fakePlannerOutput(
+  partials: unknown[],
+  final: unknown,
+  extra: Array<{ type: string; payload?: unknown }> = []
+) {
+  const chunks = [
+    ...partials.map((object) => ({ type: 'object', payload: { object } })),
+    ...extra,
+  ];
+  return {
+    fullStream: new ReadableStream({
+      start(controller) {
+        for (const chunk of chunks) {
+          controller.enqueue(chunk);
         }
         controller.close();
       },
@@ -116,7 +153,7 @@ describe('Triage', () => {
     });
   });
 
-  it('passes the prompt and the triage schema to the model', async () => {
+  it('passes the prompt, the triage schema, and its sampling settings to the model', async () => {
     generateMock.mockResolvedValue({
       object: { intent: 'planning', complexity: 'moderate', reason: 'x' },
     });
@@ -124,7 +161,11 @@ describe('Triage', () => {
 
     const [messages, options] = generateMock.mock.calls[0];
     expect(messages).toEqual([{ role: 'user', content: 'refactor this' }]);
-    expect(options).toEqual({ structuredOutput: { schema: TriageSchema } });
+    expect(options).toEqual({
+      structuredOutput: { schema: TriageSchema },
+      // The classifier pins a low temperature (agent frontmatter) for stable routing.
+      modelSettings: { temperature: 0.1 },
+    });
   });
 
   it('is configured with triage instructions', async () => {
@@ -143,8 +184,8 @@ describe('Planner', () => {
   };
 
   it('returns the final structured plan from the stream', async () => {
-    streamMock.mockResolvedValue(fakeStreamOutput([{ summary: 'do' }], plan));
-    await expect(new Planner().plan('do the thing')).resolves.toEqual(plan);
+    streamMock.mockResolvedValue(fakePlannerOutput([{ summary: 'do' }], plan));
+    await expect(new Planner(toolHostStub).plan('do the thing')).resolves.toEqual(plan);
   });
 
   it('forwards each partial snapshot to the callback in order', async () => {
@@ -153,37 +194,164 @@ describe('Planner', () => {
       { summary: 'do the thing' },
       { summary: 'do the thing', steps: [{ title: 'Read it' }] },
     ];
-    streamMock.mockResolvedValue(fakeStreamOutput(partials, plan));
+    streamMock.mockResolvedValue(fakePlannerOutput(partials, plan));
 
     const seen: PartialPlan[] = [];
-    await new Planner().plan('do the thing', (partial) => seen.push(partial));
+    await new Planner(toolHostStub).plan('do the thing', (partial) => seen.push(partial));
     expect(seen).toEqual(partials);
   });
 
   it('drains the stream even without a callback', async () => {
     streamMock.mockResolvedValue(
-      fakeStreamOutput([{ summary: 'do' }, { summary: 'do the thing' }], plan)
+      fakePlannerOutput([{ summary: 'do' }, { summary: 'do the thing' }], plan)
     );
-    await expect(new Planner().plan('do the thing')).resolves.toEqual(plan);
+    await expect(new Planner(toolHostStub).plan('do the thing')).resolves.toEqual(plan);
   });
 
   it('passes the prompt and the plan schema to the model', async () => {
-    streamMock.mockResolvedValue(fakeStreamOutput([], plan));
-    await new Planner().plan('build a feature');
+    streamMock.mockResolvedValue(fakePlannerOutput([], plan));
+    await new Planner(toolHostStub).plan('build a feature');
 
     const [messages, options] = streamMock.mock.calls[0];
     expect(messages).toEqual([{ role: 'user', content: 'build a feature' }]);
-    expect(options).toEqual({ structuredOutput: { schema: PlanSchema } });
+    // The plan schema rides on every batch, alongside the loop's step cap.
+    expect(options.structuredOutput).toEqual({ schema: PlanSchema });
+    expect(options.stopWhen).toBeDefined();
+  });
+
+  it('builds its read, search, and clarify tools', async () => {
+    // clarify is built only when the run's offered tools include it (the client
+    // lists it when it can ask); read and search are always there.
+    const hostWithClarify: ToolHost = {
+      tools: ['read', 'search', 'run', 'write', 'edit', 'clarify'],
+      execute: async () => 'ok',
+    };
+    new Planner(hostWithClarify);
+    const config = agentCtor.mock.calls.at(-1)![0] as { tools: Record<string, unknown> };
+    expect(Object.keys(config.tools).sort()).toEqual(['clarify', 'read', 'search']);
+  });
+
+  it('omits the clarify tool when the run does not offer it', async () => {
+    new Planner(toolHostStub);
+    const config = agentCtor.mock.calls.at(-1)![0] as { tools: Record<string, unknown> };
+    expect(Object.keys(config.tools).sort()).toEqual(['read', 'search']);
   });
 
   it('rejects when the final object does not match the plan schema even after a repair', async () => {
     // A fresh output per call so the retry re-streams rather than re-reading a
     // locked stream; both fail validation (steps below the min), so the run dies.
     streamMock.mockImplementation(async () =>
-      fakeStreamOutput([], { summary: 's', steps: [] })
+      fakePlannerOutput([], { summary: 's', steps: [] })
     );
-    await expect(new Planner().plan('bad')).rejects.toThrow();
+    await expect(new Planner(toolHostStub).plan('bad')).rejects.toThrow();
     expect(streamMock).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('Responder', () => {
+  const oneshot = {
+    intent: 'oneshot' as const,
+    reason: 'just a question',
+    complexity: 'simple' as const,
+    answer: 'a closure captures its scope',
+  };
+  const planning = {
+    intent: 'planning' as const,
+    reason: 'needs a change',
+    complexity: 'moderate' as const,
+    summary: 'do the thing',
+    steps: [{ title: 'Read it', detail: 'because' }],
+  };
+
+  it('returns a normalised oneshot decision from the stream', async () => {
+    streamMock.mockResolvedValue(fakeStreamOutput([{ intent: 'oneshot' }], oneshot));
+    await expect(new Responder().respond('what is a closure')).resolves.toEqual({
+      intent: 'oneshot',
+      reason: 'just a question',
+      complexity: 'simple',
+      answer: 'a closure captures its scope',
+    });
+  });
+
+  it('returns a direct decision carrying no plan or answer', async () => {
+    const direct = { intent: 'direct' as const, reason: 'small edit', complexity: 'simple' as const };
+    streamMock.mockResolvedValue(fakeStreamOutput([{ intent: 'direct' }], direct));
+    await expect(new Responder().respond('rename tmp to buffer')).resolves.toEqual({
+      intent: 'direct',
+      reason: 'small edit',
+      complexity: 'simple',
+    });
+  });
+
+  it('repairs a direct object that wrongly carries a plan-only field as still valid', async () => {
+    // "direct" requires no extra fields, so a bare intent/reason/complexity is
+    // valid on the first try (no repair needed).
+    const direct = { intent: 'direct' as const, reason: 'r', complexity: 'simple' as const };
+    streamMock.mockResolvedValue(fakeStreamOutput([], direct));
+    await expect(new Responder().respond('tiny change')).resolves.toMatchObject({
+      intent: 'direct',
+    });
+    expect(streamMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('returns a planning decision carrying a full plan with its complexity', async () => {
+    streamMock.mockResolvedValue(fakeStreamOutput([{ intent: 'planning' }], planning));
+    await expect(new Responder().respond('refactor it')).resolves.toEqual({
+      intent: 'planning',
+      reason: 'needs a change',
+      complexity: 'moderate',
+      plan: {
+        summary: 'do the thing',
+        steps: [{ title: 'Read it', detail: 'because' }],
+        complexity: 'moderate',
+      },
+    });
+  });
+
+  it('forwards a snapshot only once the route (intent) is known', async () => {
+    const partials = [
+      {}, // no intent yet -> withheld
+      { intent: 'oneshot', reason: 'r', answer: 'It' },
+      { intent: 'oneshot', reason: 'r', answer: 'It is 4.' },
+    ];
+    streamMock.mockResolvedValue(fakeStreamOutput(partials, oneshot));
+
+    const seen: ResponderProgress[] = [];
+    await new Responder().respond('q', (p) => seen.push(p));
+    expect(seen).toEqual([
+      { intent: 'oneshot', reason: 'r', complexity: undefined, answer: 'It' },
+      { intent: 'oneshot', reason: 'r', complexity: undefined, answer: 'It is 4.' },
+    ]);
+  });
+
+  it('passes the prompt and the responder object schema to the model', async () => {
+    streamMock.mockResolvedValue(fakeStreamOutput([], oneshot));
+    await new Responder().respond('explain closures');
+
+    const [messages, options] = streamMock.mock.calls[0];
+    expect(messages).toEqual([{ role: 'user', content: 'explain closures' }]);
+    expect(options).toEqual({ structuredOutput: { schema: ResponderObjectSchema } });
+  });
+
+  it('repairs once when a planning object arrives without steps', async () => {
+    streamMock
+      // intent says planning but no steps/summary -> fails the refine.
+      .mockResolvedValueOnce(fakeStreamOutput([], { intent: 'planning', reason: 'r', complexity: 'moderate' }))
+      .mockResolvedValueOnce(fakeStreamOutput([], planning));
+
+    const result = await new Responder().respond('build it');
+    expect(result.intent).toBe('planning');
+    expect(streamMock).toHaveBeenCalledTimes(2);
+    const retryContent = streamMock.mock.calls[1][0][0].content as string;
+    expect(retryContent).toContain('build it');
+    expect(retryContent).toContain('failed validation');
+  });
+
+  it('is configured with responder instructions', async () => {
+    new Responder();
+    const config = agentCtor.mock.calls[0][0] as { id: string; instructions: string };
+    expect(config.id).toBe('responder');
+    expect(config.instructions).toContain('responder');
   });
 });
 
@@ -260,7 +428,9 @@ describe('Answerer', () => {
 
     const [messages, options] = streamMock.mock.calls[0];
     expect(messages).toEqual([{ role: 'user', content: 'explain closures' }]);
-    expect(options).toBeUndefined();
+    // No structured output; the answerer sets no sampling params either, so
+    // modelSettings rides as undefined and the provider defaults apply.
+    expect(options).toEqual({ modelSettings: undefined });
   });
 
   it('splits reasoning from the answer, forwarding only thinking', async () => {
@@ -451,13 +621,18 @@ describe('Executor', () => {
     expect(result.events).toHaveLength(3);
   });
 
-  it('passes the prompt and the step cap to the model', async () => {
+  it('passes the prompt and a batch stop condition to the model', async () => {
     streamMock.mockResolvedValue(fakeChunkOutput([]));
     await new Executor(toolHostStub).execute('carry out the plan');
 
     const [messages, options] = streamMock.mock.calls[0];
     expect(messages).toEqual([{ role: 'user', content: 'carry out the plan' }]);
-    expect(options).toEqual({ maxSteps: settings.executor.maxSteps });
+    // The batched loop bounds each stream call with a `stopWhen` array (a step
+    // condition, plus a time condition when check-ins are on), not `maxSteps`.
+    // With no check-in seam there is only the step condition.
+    expect(Array.isArray((options as { stopWhen?: unknown[] }).stopWhen)).toBe(true);
+    expect((options as { stopWhen: unknown[] }).stopWhen).toHaveLength(1);
+    expect((options as { maxSteps?: number }).maxSteps).toBeUndefined();
   });
 
   it('forwards a cancellation signal to the model when one is given', async () => {
@@ -466,10 +641,8 @@ describe('Executor', () => {
     await new Executor(toolHostStub).execute('go', undefined, controller.signal);
 
     const [, options] = streamMock.mock.calls[0];
-    expect(options).toEqual({
-      maxSteps: settings.executor.maxSteps,
-      abortSignal: controller.signal,
-    });
+    expect((options as { abortSignal?: AbortSignal }).abortSignal).toBe(controller.signal);
+    expect(Array.isArray((options as { stopWhen?: unknown[] }).stopWhen)).toBe(true);
   });
 
   it('is configured with executor instructions, the workspace tools, and progress', () => {
@@ -494,8 +667,19 @@ describe('Executor', () => {
     expect(config.instructions).not.toContain('Additional tools');
   });
 
+  it('appends model-specific steering for a weak pinned model, none for a strong one', () => {
+    new Executor(toolHostStub, 'gemma3-4b');
+    const weak = agentCtor.mock.calls[0][0] as { instructions: string };
+    expect(weak.instructions).toContain('## Model-specific guidance');
+
+    agentCtor.mockReset();
+    new Executor(toolHostStub, 'anthropic-opus');
+    const strong = agentCtor.mock.calls[0][0] as { instructions: string };
+    expect(strong.instructions).not.toContain('## Model-specific guidance');
+  });
+
   it('adds MCP tools and an additional-tools prompt section when given dynamic tools', () => {
-    new Executor(toolHostStub, undefined, undefined, undefined, [
+    new Executor(toolHostStub, undefined, undefined, [
       { name: 'mcp__fs__read', description: 'Read a file via MCP.', inputSchema: {} },
     ]);
     const config = agentCtor.mock.calls[0][0] as {
@@ -751,6 +935,214 @@ describe('Executor', () => {
   });
 });
 
+describe('Executor check-ins', () => {
+  // A batch output that reports how many steps it ran and why it stopped, so the
+  // batched loop can tell a cut-off batch (which triggers a check-in) from a
+  // model that finished on its own.
+  function fakeBatch(
+    chunks: Array<{ type: string; payload?: unknown }>,
+    opts: { steps?: number; finishReason?: string } = {}
+  ) {
+    return {
+      fullStream: new ReadableStream({
+        start(controller) {
+          for (const chunk of chunks) {
+            controller.enqueue(chunk);
+          }
+          controller.close();
+        },
+      }),
+      response: Promise.resolve({ messages: [] }),
+      steps: Promise.resolve(new Array(opts.steps ?? 0).fill({})),
+      finishReason: Promise.resolve(opts.finishReason),
+    };
+  }
+
+  const toolCallBatch = [
+    { type: 'tool-call', payload: { toolCallId: 'c1', toolName: 'read', args: { path: 'a.ts' } } },
+    { type: 'tool-result', payload: { toolCallId: 'c1', toolName: 'read', result: 'x' } },
+  ];
+
+  let original: ReturnType<typeof runtimeConfig>;
+  beforeEach(() => {
+    original = runtimeConfig();
+  });
+  afterEach(() => {
+    setRuntimeConfig(original);
+  });
+
+  it('checks in after the step interval and continues when told to', async () => {
+    setRuntimeConfig({ ...original, checkpointEverySteps: 1, checkpointEverySeconds: 0 });
+    // Batch 1 spends the 1-step budget on a tool call (cut off -> check-in);
+    // batch 2 produces the final text and finishes on its own.
+    streamMock.mockResolvedValueOnce(fakeBatch(toolCallBatch, { steps: 1, finishReason: 'tool-calls' }));
+    streamMock.mockResolvedValueOnce(
+      fakeBatch([{ type: 'text-delta', payload: { id: 't', text: 'Done.' } }], {
+        steps: 1,
+        finishReason: 'stop',
+      })
+    );
+    const onCheckpoint = vi.fn().mockResolvedValue({ kind: 'continue' });
+
+    const result = await new Executor(toolHostStub).execute(
+      'do it',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      onCheckpoint
+    );
+
+    expect(onCheckpoint).toHaveBeenCalledTimes(1);
+    expect(onCheckpoint.mock.calls[0][0]).toMatchObject({ stepsDone: 1, lastAction: 'read' });
+    expect(streamMock).toHaveBeenCalledTimes(2);
+    expect(result.events.at(-1)).toEqual({ kind: 'text', text: 'Done.' });
+  });
+
+  it('stops on "stop" and runs a no-tools wrap-up turn', async () => {
+    setRuntimeConfig({ ...original, checkpointEverySteps: 1, checkpointEverySeconds: 0 });
+    streamMock.mockResolvedValueOnce(fakeBatch(toolCallBatch, { steps: 1, finishReason: 'tool-calls' }));
+    // The wrap-up batch: tools off, model summarizes what it has.
+    streamMock.mockResolvedValueOnce(
+      fakeBatch([{ type: 'text-delta', payload: { id: 's', text: 'Here is what I found.' } }], {
+        steps: 1,
+        finishReason: 'stop',
+      })
+    );
+    const onCheckpoint = vi.fn().mockResolvedValue({ kind: 'stop' });
+
+    const result = await new Executor(toolHostStub).execute(
+      'do it',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      onCheckpoint
+    );
+
+    expect(onCheckpoint).toHaveBeenCalledTimes(1);
+    expect(streamMock).toHaveBeenCalledTimes(2);
+    // The wrap-up turn turns tools off so the model can only conclude.
+    expect(streamMock.mock.calls[1][1]).toMatchObject({ toolChoice: 'none' });
+    expect(result.events.at(-1)).toEqual({ kind: 'text', text: 'Here is what I found.' });
+  });
+
+  it('never checks in when both intervals are off', async () => {
+    setRuntimeConfig({ ...original, checkpointEverySteps: 0, checkpointEverySeconds: 0 });
+    // One batch that finishes on its own (fewer steps than the ceiling).
+    streamMock.mockResolvedValueOnce(
+      fakeBatch([{ type: 'text-delta', payload: { id: 't', text: 'ok' } }], {
+        steps: 1,
+        finishReason: 'stop',
+      })
+    );
+    const onCheckpoint = vi.fn().mockResolvedValue({ kind: 'continue' });
+
+    await new Executor(toolHostStub).execute(
+      'do it',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      onCheckpoint
+    );
+
+    expect(onCheckpoint).not.toHaveBeenCalled();
+    expect(streamMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('Executor context warnings', () => {
+  // A batch output that also reports its input-token count, so the executor can
+  // measure how full the model's context window is.
+  function fakeBatch(
+    chunks: Array<{ type: string; payload?: unknown }>,
+    opts: { steps?: number; finishReason?: string; inputTokens?: number } = {}
+  ) {
+    return {
+      fullStream: new ReadableStream({
+        start(controller) {
+          for (const chunk of chunks) {
+            controller.enqueue(chunk);
+          }
+          controller.close();
+        },
+      }),
+      response: Promise.resolve({ messages: [] }),
+      steps: Promise.resolve(new Array(opts.steps ?? 1).fill({})),
+      finishReason: Promise.resolve(opts.finishReason ?? 'stop'),
+      usage:
+        opts.inputTokens === undefined
+          ? undefined
+          : Promise.resolve({ inputTokens: opts.inputTokens }),
+    };
+  }
+
+  const doneChunk = { type: 'text-delta', payload: { id: 't', text: 'done' } };
+
+  let original: ReturnType<typeof runtimeConfig>;
+  beforeEach(() => {
+    original = runtimeConfig();
+  });
+  afterEach(() => {
+    setRuntimeConfig(original);
+  });
+
+  it('warns once for the highest threshold the reported usage crosses', async () => {
+    // Auto routes the executor to qwen3-coder in tests; a small override window
+    // makes a modest reported input count cross the 90% threshold.
+    setRuntimeConfig({
+      ...original,
+      modelContextWindows: { 'qwen3-coder': 1000 },
+      contextWarnThresholds: [80, 90, 95],
+    });
+    streamMock.mockResolvedValueOnce(fakeBatch([doneChunk], { inputTokens: 920 }));
+    const onContextWarning = vi.fn();
+
+    // Pin the model so the routed id (and thus the override) is deterministic.
+    await new Executor(toolHostStub, 'qwen3-coder').execute(
+      'do it',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      onContextWarning
+    );
+
+    expect(onContextWarning).toHaveBeenCalledTimes(1);
+    expect(onContextWarning.mock.calls[0][0]).toMatchObject({
+      threshold: 90,
+      percent: 92,
+      contextWindow: 1000,
+      estimated: false,
+      model: expect.stringContaining('Qwen3 Coder'),
+    });
+  });
+
+  it('does not warn while usage stays below every threshold', async () => {
+    setRuntimeConfig({
+      ...original,
+      modelContextWindows: { 'qwen3-coder': 1000 },
+      contextWarnThresholds: [80, 90, 95],
+    });
+    streamMock.mockResolvedValueOnce(fakeBatch([doneChunk], { inputTokens: 100 }));
+    const onContextWarning = vi.fn();
+
+    await new Executor(toolHostStub, 'qwen3-coder').execute(
+      'do it',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      onContextWarning
+    );
+
+    expect(onContextWarning).not.toHaveBeenCalled();
+  });
+});
+
 describe('self-repair for malformed structured output', () => {
   const counts = { inputTokens: 11, outputTokens: 7 };
   const plan = {
@@ -800,10 +1192,10 @@ describe('self-repair for malformed structured output', () => {
   it('Planner retries once with the validation error and returns the corrected plan', async () => {
     streamMock
       // First plan has no steps (below the min), so it fails the schema.
-      .mockResolvedValueOnce(fakeStreamOutput([], { summary: 's', steps: [] }))
-      .mockResolvedValueOnce(fakeStreamOutput([], plan));
+      .mockResolvedValueOnce(fakePlannerOutput([], { summary: 's', steps: [] }))
+      .mockResolvedValueOnce(fakePlannerOutput([], plan));
 
-    await expect(new Planner().plan('build it')).resolves.toEqual(plan);
+    await expect(new Planner(toolHostStub).plan('build it')).resolves.toEqual(plan);
     expect(streamMock).toHaveBeenCalledTimes(2);
     const retryContent = streamMock.mock.calls[1][0][0].content as string;
     expect(retryContent).toContain('build it');
@@ -812,11 +1204,11 @@ describe('self-repair for malformed structured output', () => {
 
   it('Planner reports both calls, flagging only the repair as repaired', async () => {
     streamMock
-      .mockResolvedValueOnce(fakeStreamOutput([], { summary: 's', steps: [] }))
-      .mockResolvedValueOnce({ ...fakeStreamOutput([], plan), usage: Promise.resolve(counts) });
+      .mockResolvedValueOnce(fakePlannerOutput([], { summary: 's', steps: [] }))
+      .mockResolvedValueOnce({ ...fakePlannerOutput([], plan), usage: Promise.resolve(counts) });
 
     const seen: AgentUsage[] = [];
-    await new Planner().plan('build it', undefined, (usage) => seen.push(usage));
+    await new Planner(toolHostStub).plan('build it', undefined, (usage) => seen.push(usage));
     expect(seen).toHaveLength(2);
     expect(seen[0].repaired).toBeUndefined();
     expect(seen[1].repaired).toBe(true);
@@ -881,11 +1273,11 @@ describe('usage reporting', () => {
 
   it('Planner reports usage off the drained stream', async () => {
     streamMock.mockResolvedValue({
-      ...fakeStreamOutput([], plan),
+      ...fakePlannerOutput([], plan),
       usage: Promise.resolve(counts),
     });
     const seen: AgentUsage[] = [];
-    await new Planner().plan('p', undefined, (usage) => seen.push(usage));
+    await new Planner(toolHostStub).plan('p', undefined, (usage) => seen.push(usage));
     expect(seen).toEqual([
       { model: routeModel(agents.planner.capabilities).model, ...counts },
     ]);

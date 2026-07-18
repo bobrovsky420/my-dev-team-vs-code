@@ -42,13 +42,18 @@ describe('TriageSchema', () => {
     );
   });
 
-  it('describes the intent boundary as the deliverable, file changes as planning', () => {
-    // The description is part of what the model sees in structured-output
-    // mode, so it must reinforce the triage prompt: any file to create or
-    // modify routes to planning, even a single small one.
+  it('describes the three-way intent boundary (oneshot / direct / planning)', () => {
+    // The description is part of what the model sees in structured-output mode,
+    // so it must reinforce the triage prompt's three routes: text in the chat
+    // (oneshot), a small fully-specified change (direct), or a larger/uncertain
+    // change to decompose first (planning).
     const description = TriageSchema.shape.intent.description ?? '';
-    expect(description).toContain('create or modify');
-    expect(description).toContain('even one small file');
+    expect(description).toContain('"oneshot"');
+    expect(description).toContain('"direct"');
+    expect(description).toContain('"planning"');
+    // The direct/planning boundary is small-and-specified vs larger-or-uncertain.
+    expect(description).toContain('small');
+    expect(description).toContain('decompose');
   });
 });
 

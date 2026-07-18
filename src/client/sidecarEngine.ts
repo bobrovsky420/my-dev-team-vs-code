@@ -2,11 +2,12 @@
  * The client end of the sidecar: an `Engine` that runs the real engine in a
  * child process. It owns no agent logic - it forwards each run over the channel,
  * folds the child's events back into `client.onEvent`, and services the engine's
- * inversions on this side of the boundary: a `tool-call` runs through the real
- * `client.toolHost` (so files, the shell, and the approval gate stay in the
- * editor), and a `plan-review` runs through the real `client.reviewPlan`. The
- * run's result is settled from the terminal `result` message, rethrowing the
- * same `RunFailedError`/`RunCancelledError` the in-process engine would have.
+ * inversion on this side of the boundary: every `invoke` runs through the real
+ * `client.invoke` (so files, the shell, the approval gate, the plan-review and
+ * check-in prompts, the clarify pop-up, and the skill bodies all stay in the
+ * editor), named by capability. The run's result is settled from the terminal
+ * `result` message, rethrowing the same `RunFailedError`/`RunCancelledError` the
+ * in-process engine would have.
  *
  * Before any run is started the parent waits for the child's `ready` handshake
  * (which carries the protocol version the child speaks): a stale `dist/sidecar.js`
@@ -30,7 +31,9 @@ import {
   RunCancelledError,
 } from '../protocol/engine';
 import { RunRequest, Reply, ModelChoice, PROTOCOL_VERSION } from '../protocol/types';
+import { CapabilityName } from '../protocol/capabilities';
 import { RuntimeConfig } from '../config/runtimeConfig';
+import { DebugEntry } from '../config/debugLog';
 import { settings } from '../config/settings';
 import { messages } from '../config/messages';
 import { SidecarChannel, ChildMessage, ParentMessage, RunResult } from '../sidecar/transport';
@@ -69,7 +72,9 @@ export class SidecarEngine implements Engine {
 
   constructor(
     private readonly channel: SidecarChannel,
-    private readonly getConfig: () => RuntimeConfig
+    private readonly getConfig: () => RuntimeConfig,
+    /** Where the child's debug entries (its provider-API traffic) are written. */
+    private readonly onDebug?: (entry: DebugEntry) => void
   ) {
     channel.onMessage((msg) => this.handle(msg));
     channel.onClose((reason) => this.handleClose(reason));
@@ -137,7 +142,9 @@ export class SidecarEngine implements Engine {
             t: 'start',
             runId,
             request,
-            canReviewPlan: !!client.reviewPlan,
+            // Advertise exactly what the real client implements, so the child's
+            // proxy host offers the same set and the engine degrades the rest.
+            capabilities: [...client.capabilities],
           });
         },
         (err) => this.failRun(runId, err)
@@ -219,41 +226,49 @@ export class SidecarEngine implements Engine {
       case 'event':
         this.runs.get(msg.runId)?.client.onEvent(msg.event);
         return;
-      case 'tool-call': {
+      case 'debug':
+        // The child's engine debug entries (provider-API traffic); the parent
+        // owns the output channel they are written to.
+        this.onDebug?.(msg.entry);
+        return;
+      case 'invoke': {
         const state = this.runs.get(msg.runId);
         if (!state) {
-          // A `tool-call` for a run we no longer track (a late or duplicate
+          // An `invoke` for a run we no longer track (a late or duplicate
           // message, or one whose run already settled). Answer with an error so
           // the child's awaiting promise settles instead of leaking, rather than
           // dropping it silently.
           this.channel.post({
-            t: 'tool-result',
+            t: 'invoke-result',
             callId: msg.callId,
             ok: false,
             error: messages.sidecar.orphanToolCall,
           });
           return;
         }
-        state.client.toolHost.execute(msg.tool, msg.args, state.ac.signal, msg.runId).then(
+        // The run's real client services the capability: a tool through the
+        // ToolHost and approval gate, a plan review / check-in / clarify through
+        // its pop-up, a skill body from the bodies collected this turn. The abort
+        // signal lets a cancelled run stop an in-flight tool, and the run id
+        // attributes a tool's approval prompt to the owning turn. The dispatch is
+        // generic, so the capability/payload types are erased to the wire's
+        // `unknown` here and restored by the client's own typed handlers.
+        const invoke = state.client.invoke as (
+          capability: CapabilityName,
+          payload: unknown,
+          signal?: AbortSignal,
+          correlationId?: string
+        ) => Promise<unknown>;
+        invoke(msg.capability, msg.payload, state.ac.signal, msg.runId).then(
           (result) =>
-            this.channel.post({ t: 'tool-result', callId: msg.callId, ok: true, result }),
+            this.channel.post({ t: 'invoke-result', callId: msg.callId, ok: true, result }),
           (err) =>
             this.channel.post({
-              t: 'tool-result',
+              t: 'invoke-result',
               callId: msg.callId,
               ok: false,
               error: err instanceof Error ? err.message : String(err),
             })
-        );
-        return;
-      }
-      case 'plan-review': {
-        const review = this.runs.get(msg.runId)?.client.reviewPlan;
-        if (!review) {
-          return;
-        }
-        void review(msg.plan, msg.complexity).then((decision) =>
-          this.channel.post({ t: 'plan-decision', reviewId: msg.reviewId, decision })
         );
         return;
       }

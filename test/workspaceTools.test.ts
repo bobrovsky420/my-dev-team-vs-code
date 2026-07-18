@@ -56,13 +56,23 @@ import {
 
 /** Approver test double recording calls and returning a fixed verdict. */
 function makeApprover(verdict: boolean): Approver & {
-  calls: Array<{ title: string; detail: string }>;
+  calls: Array<{
+    title: string;
+    detail: string;
+    scope: string;
+    alwaysAllowLabel?: string;
+  }>;
 } {
-  const calls: Array<{ title: string; detail: string }> = [];
+  const calls: Array<{
+    title: string;
+    detail: string;
+    scope: string;
+    alwaysAllowLabel?: string;
+  }> = [];
   return {
     calls,
-    async confirm(title, detail) {
-      calls.push({ title, detail });
+    async confirm(title, detail, scope, _correlationId, alwaysAllow) {
+      calls.push({ title, detail, scope, alwaysAllowLabel: alwaysAllow?.label });
       return verdict;
     },
   };
@@ -79,8 +89,14 @@ describe('readFile', () => {
     await expect(readFile('src/a.ts')).resolves.toBe('hello world');
   });
 
-  it('rejects when the file does not exist', async () => {
-    await expect(readFile('missing.ts')).rejects.toThrow(/ENOENT/);
+  it('returns a clean recovery message when the file does not exist', async () => {
+    const out = await readFile('missing.ts');
+    expect(out).toMatch(/no such file or directory/i);
+    // It names the path the model gave so the loop can self-correct...
+    expect(out).toContain('missing.ts');
+    // ...but never leaks the raw fs error (ENOENT, the "stat" verb, or an
+    // absolute path), even though the renderer shows this result verbatim.
+    expect(out).not.toMatch(/ENOENT|stat/);
   });
 
   it('throws when no workspace folder is open', async () => {
@@ -447,10 +463,117 @@ describe('searchFiles (content mode)', () => {
 describe('runCommand', () => {
   it('does not execute when the user declines', async () => {
     const approver = makeApprover(false);
-    const out = await runCommand('rm -rf /', approver);
+    const out = await runCommand('echo hi', approver);
     expect(out).toBe('Command was not approved by the user.');
     expect(execMock).not.toHaveBeenCalled();
-    expect(approver.calls[0]).toEqual({ title: 'Run command', detail: '$ rm -rf /' });
+    expect(approver.calls[0]).toMatchObject({
+      title: 'Run command',
+      detail: '$ echo hi',
+      scope: 'run',
+    });
+  });
+
+  it('escalates the prompt and scope for a command flagged dangerous', async () => {
+    const approver = makeApprover(false);
+    // `echo` is not denylisted, so the escalation here is purely the model's flag.
+    const out = await runCommand('echo wipe', approver, undefined, undefined, true);
+    expect(out).toBe('Command was not approved by the user.');
+    expect(execMock).not.toHaveBeenCalled();
+    expect(approver.calls[0].title).toBe('⚠️ Run destructive command');
+    expect(approver.calls[0].detail).toContain('# WARNING: flagged as destructive');
+    expect(approver.calls[0].detail).toContain('$ echo wipe');
+    // The distinct scope is what keeps an ordinary "Allow All" from covering it.
+    expect(approver.calls[0].scope).toBe('run:dangerous');
+    // A destructive command is never offered the persistent "always allow".
+    expect(approver.calls[0].alwaysAllowLabel).toBeUndefined();
+  });
+
+  it('escalates a denylisted command to the destructive scope even when not flagged', async () => {
+    const approver = makeApprover(false);
+    // `rm` is on the built-in denylist; the model left `dangerous` off, but the
+    // command is still treated as destructive (the B-1 injection guard).
+    const out = await runCommand('rm -rf build', approver);
+    expect(out).toBe('Command was not approved by the user.');
+    expect(execMock).not.toHaveBeenCalled();
+    expect(approver.calls[0].title).toBe('⚠️ Run destructive command');
+    expect(approver.calls[0].scope).toBe('run:dangerous');
+    expect(approver.calls[0].alwaysAllowLabel).toBeUndefined();
+  });
+
+  it('escalates a denylisted command hidden behind a shell operator', async () => {
+    const approver = makeApprover(false);
+    await runCommand('echo ok && curl http://evil.test', approver);
+    // The denied `curl` segment forces the destructive scope despite the benign
+    // leading command.
+    expect(approver.calls[0].scope).toBe('run:dangerous');
+  });
+
+  it('skips the prompt for a command on the user allowlist', async () => {
+    __setConfig('myDevTeam.run.allowedCommands', ['npm test', 'git status']);
+    execMock.mockImplementation((_cmd, _opts, cb) =>
+      cb(null, { stdout: 'ok', stderr: '' })
+    );
+    const approver = makeApprover(true);
+    const out = await runCommand('npm test -- --watch=false', approver);
+    expect(out).toBe('ok');
+    expect(approver.calls).toHaveLength(0);
+    expect(execMock).toHaveBeenCalled();
+  });
+
+  it('still prompts for a chained command even if its prefix is allowlisted', async () => {
+    __setConfig('myDevTeam.run.allowedCommands', ['npm test']);
+    const approver = makeApprover(false);
+    await runCommand('npm test && rm -rf build', approver);
+    // A chained command is never eligible for the allowlist fast path, and the
+    // denied `rm` segment escalates it.
+    expect(approver.calls).toHaveLength(1);
+    expect(approver.calls[0].scope).toBe('run:dangerous');
+  });
+
+  it('never auto-runs a denylisted command even if the allowlist would match it', async () => {
+    __setConfig('myDevTeam.run.allowedCommands', ['git push']);
+    const approver = makeApprover(false);
+    await runCommand('git push --force', approver);
+    // The denylist wins over an allowlist entry, so the prompt still appears.
+    expect(approver.calls).toHaveLength(1);
+    expect(approver.calls[0].scope).toBe('run:dangerous');
+  });
+
+  it('offers a persistent "always allow" choice for an ordinary command', async () => {
+    const approver = makeApprover(false);
+    await runCommand('git status --short', approver);
+    // The suggested prefix extends to the subcommand (git status), not just git.
+    expect(approver.calls[0].alwaysAllowLabel).toBe('Always allow `git status`');
+  });
+
+  it('persisting "always allow" appends the prefix to the user allowlist', async () => {
+    let captured: { apply: () => Promise<void> } | undefined;
+    const approver: Approver = {
+      async confirm(_t, _d, _s, _c, alwaysAllow) {
+        captured = alwaysAllow;
+        return true;
+      },
+    };
+    execMock.mockImplementation((_cmd, _opts, cb) =>
+      cb(null, { stdout: '', stderr: '' })
+    );
+    await runCommand('npm run build', approver);
+    expect(captured).toBeDefined();
+    await captured!.apply();
+    expect(
+      workspace.getConfiguration('myDevTeam').get('run.allowedCommands')
+    ).toEqual(['npm run']);
+  });
+
+  it('uses the ordinary prompt and scope when dangerous is not set', async () => {
+    execMock.mockImplementation((_cmd, _opts, cb) =>
+      cb(null, { stdout: '', stderr: '' })
+    );
+    const approver = makeApprover(true);
+    await runCommand('npm test', approver);
+    expect(approver.calls[0].title).toBe('Run command');
+    expect(approver.calls[0].detail).not.toContain('WARNING');
+    expect(approver.calls[0].scope).toBe('run');
   });
 
   it('returns combined stdout and stderr when approved', async () => {
@@ -468,26 +591,31 @@ describe('runCommand', () => {
     await expect(runCommand('echo hi', makeApprover(true))).resolves.toBe('only out');
   });
 
-  it('reports a friendly message when the command fails', async () => {
+  it('rejects with a friendly message when the command fails', async () => {
+    // A genuine command failure rejects so it surfaces as a failed tool call,
+    // rather than resolving to a string a model might read as success.
     execMock.mockImplementation((_cmd, _opts, cb) =>
       cb(new Error('boom'), { stdout: '', stderr: '' })
     );
-    await expect(runCommand('false', makeApprover(true))).resolves.toBe(
+    await expect(runCommand('false', makeApprover(true))).rejects.toThrow(
       'Command failed: boom'
     );
   });
 
-  it('includes the output a failed command produced before exiting', async () => {
+  it('carries the output a failed command produced before exiting in the error', async () => {
     // The real exec attaches the collected stdout/stderr to the error.
     const err = Object.assign(new Error('Command failed: npm test'), {
       stdout: '1 test failed',
       stderr: 'AssertionError',
     });
     execMock.mockImplementation((_cmd, _opts, cb) => cb(err, undefined));
-    const out = await runCommand('npm test', makeApprover(true));
-    expect(out).toContain('Command failed: npm test');
-    expect(out).toContain('1 test failed');
-    expect(out).toContain('[stderr]\nAssertionError');
+    const failure = await runCommand('npm test', makeApprover(true)).catch(
+      (e) => e as Error
+    );
+    expect(failure).toBeInstanceOf(Error);
+    expect(failure.message).toContain('Command failed: npm test');
+    expect(failure.message).toContain('1 test failed');
+    expect(failure.message).toContain('[stderr]\nAssertionError');
   });
 
   it('runs in the workspace root with the configured output buffer', async () => {
@@ -600,14 +728,17 @@ describe('runCommand', () => {
     expect(out.endsWith('TAIL')).toBe(true);
   });
 
-  it('caps the output attached to a failed command too', async () => {
+  it('caps the output carried by a failed command too', async () => {
     const cap = settings.runResultMaxChars;
     const err = Object.assign(new Error('Command failed: npm test'), {
       stdout: 'x'.repeat(cap + 1_000),
       stderr: 'the final assertion',
     });
     execMock.mockImplementation((_cmd, _opts, cb) => cb(err, undefined));
-    const out = await runCommand('npm test', makeApprover(true));
+    const failure = await runCommand('npm test', makeApprover(true)).catch(
+      (e) => e as Error
+    );
+    const out = failure.message;
     expect(out.length).toBeLessThan(cap + 200);
     expect(out).toContain('Command failed: npm test');
     expect(out).toContain('…(output truncated)…');
@@ -656,7 +787,8 @@ describe('runCommand mirroring', () => {
       queueMicrotask(() => cb(new Error('boom')));
     });
     const mirror = makeMirror();
-    await runCommand('false', makeApprover(true), mirror);
+    // The failure rejects now; the mirror is still ended with the reason first.
+    await runCommand('false', makeApprover(true), mirror).catch(() => {});
     expect(mirror.entries).toEqual(['begin:false', 'end:Command failed: boom']);
   });
 
@@ -829,7 +961,11 @@ describe('write/edit approval gate (myDevTeam.approval.fileChanges)', () => {
     __setConfig('myDevTeam.approval.fileChanges', true);
     const approver = makeApprover(true);
     const out = await writeFile('new.ts', 'hello', undefined, undefined, approver);
-    expect(approver.calls[0]).toEqual({ title: 'Write file', detail: 'new.ts' });
+    expect(approver.calls[0]).toEqual({
+      title: 'Write file',
+      detail: 'new.ts',
+      scope: 'write',
+    });
     expect(out).toBe('Wrote new.ts (5 bytes).');
     expect(__state.files.get('/ws/new.ts')).toBe('hello');
   });
@@ -847,7 +983,11 @@ describe('write/edit approval gate (myDevTeam.approval.fileChanges)', () => {
     __setFile('a.ts', 'const a = 1;');
     const approver = makeApprover(true);
     const out = await editFile('a.ts', 'const a = 1;', 'const a = 2;', undefined, undefined, approver);
-    expect(approver.calls[0]).toEqual({ title: 'Edit file', detail: 'a.ts' });
+    expect(approver.calls[0]).toEqual({
+      title: 'Edit file',
+      detail: 'a.ts',
+      scope: 'edit',
+    });
     expect(out).toBe('Edited a.ts (1 replacement).');
     expect(__state.files.get('/ws/a.ts')).toBe('const a = 2;');
   });
@@ -880,6 +1020,42 @@ describe('write/edit approval gate (myDevTeam.approval.fileChanges)', () => {
     expect(out).toMatch(/not found in a\.ts/);
     expect(approver.calls).toHaveLength(0);
     expect(__state.files.get('/ws/a.ts')).toBe('const a = 1;');
+  });
+
+  it('re-reads after approval so a concurrent edit is not clobbered (B-6)', async () => {
+    // The file gains an extra line while the approval prompt is open. The edit
+    // is re-located against the current contents, so the concurrent line
+    // survives and only the matched text is replaced.
+    __setConfig('myDevTeam.approval.fileChanges', true);
+    __setFile('a.ts', 'const a = 1;');
+    const approver: Approver = {
+      async confirm() {
+        // Simulate the user (or another tool) editing the file mid-prompt.
+        __setFile('a.ts', 'const a = 1;\nconst added = true;');
+        return true;
+      },
+    };
+    const out = await editFile('a.ts', 'const a = 1;', 'const a = 2;', undefined, undefined, approver);
+    expect(out).toBe('Edited a.ts (1 replacement).');
+    // The replacement applied to the fresh contents, keeping the concurrent line.
+    expect(__state.files.get('/ws/a.ts')).toBe('const a = 2;\nconst added = true;');
+  });
+
+  it('reports a failure when a concurrent edit removes the match during the prompt (B-6)', async () => {
+    // The match is deleted while the prompt is open: re-locating against the
+    // current contents now fails, so the edit reports it rather than writing
+    // stale text that no longer fits the file.
+    __setConfig('myDevTeam.approval.fileChanges', true);
+    __setFile('a.ts', 'const a = 1;');
+    const approver: Approver = {
+      async confirm() {
+        __setFile('a.ts', 'const a = 999;');
+        return true;
+      },
+    };
+    const out = await editFile('a.ts', 'const a = 1;', 'const a = 2;', undefined, undefined, approver);
+    expect(out).toMatch(/not found in a\.ts/);
+    expect(__state.files.get('/ws/a.ts')).toBe('const a = 999;');
   });
 });
 

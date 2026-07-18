@@ -73,8 +73,7 @@ export class ChangeTracker implements ChangeReporter {
   report(path: string, before: string, after: string): void {
     const session = this.sessions[this.sessions.length - 1];
     if (!session) {
-      // A write outside any @devteam turn (e.g. the editor-wide tool surface):
-      // nothing is summing it, so drop it.
+      // A write with no open change session (nothing is summing it): drop it.
       return;
     }
     const existing = session.files.get(path);

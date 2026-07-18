@@ -1,18 +1,25 @@
 import { describe, it, expect } from 'vitest';
 
-import { buildAgentTools, renderDynamicToolsSection } from '../src/engine/core/agentTools';
+import {
+  buildAgentTools,
+  buildPlannerTools,
+  renderDynamicToolsSection,
+} from '../src/engine/core/agentTools';
 import { toolConfigs } from '../src/engine/config/tools';
 import { ToolHost } from '../src/protocol/toolContract';
-import { DynamicToolDef } from '../src/protocol/types';
+import { ClarifyQuestion, DynamicToolDef } from '../src/protocol/types';
 
 /** ToolHost test double recording calls and returning a fixed result. */
-function makeHost(result = 'ok'): ToolHost & {
+function makeHost(
+  result = 'ok',
+  tools: readonly string[] = ['read', 'search', 'run', 'write', 'edit']
+): ToolHost & {
   calls: Array<{ tool: string; args: unknown; signal?: AbortSignal }>;
 } {
   const calls: Array<{ tool: string; args: unknown; signal?: AbortSignal }> = [];
   return {
     calls,
-    tools: ['read', 'search', 'run', 'write', 'edit'],
+    tools,
     execute: async (tool, args, signal) => {
       calls.push({ tool, args, signal });
       return result;
@@ -55,25 +62,19 @@ describe('buildAgentTools', () => {
     expect(host.calls).toHaveLength(0);
   });
 
-  it('returns a skill body by name without a host call, and a notice for an unknown one', async () => {
-    const host = makeHost();
-    const bodies = new Map([['demo', 'the demo skill instructions']]);
-    const tools = buildAgentTools(host, undefined, bodies);
+  it('delegates the skill tool to the host by name (the client composes the result)', async () => {
+    // The skill tool is now a client call through the `tool` capability, just
+    // with its own engine-side schema: it forwards { name } to the host, which
+    // returns the body (or a "no such skill" notice the client composes).
+    const host = makeHost('the demo skill instructions');
+    const tools = buildAgentTools(host);
 
     await expect(invoke(tools.skill, { name: 'demo' })).resolves.toBe(
       'the demo skill instructions'
     );
-    const miss = (await invoke(tools.skill, { name: 'nope' })) as string;
-    expect(miss).toContain('No skill named "nope"');
-    expect(miss).toContain('demo');
-    // The skill tool never delegates to the ToolHost.
-    expect(host.calls).toHaveLength(0);
-  });
-
-  it('reports no skills available when the bodies map is empty or absent', async () => {
-    const tools = buildAgentTools(makeHost());
-    const result = (await invoke(tools.skill, { name: 'demo' })) as string;
-    expect(result).toContain('No skills are available.');
+    expect(host.calls).toContainEqual(
+      expect.objectContaining({ tool: 'skill', args: { name: 'demo' } })
+    );
   });
 
   it('delegates each call to the ToolHost with the tool name and args', async () => {
@@ -137,7 +138,7 @@ describe('buildAgentTools', () => {
         inputSchema: { type: 'object', properties: { path: { type: 'string' } } },
       },
     ];
-    const tools = buildAgentTools(host, undefined, undefined, defs);
+    const tools = buildAgentTools(host, undefined, defs);
 
     expect(Object.keys(tools)).toContain('mcp__fs__read');
     const tool = tools['mcp__fs__read' as keyof typeof tools];
@@ -155,7 +156,7 @@ describe('buildAgentTools', () => {
     const defs: DynamicToolDef[] = [
       { name: 'mcp__x__y', description: 'd', inputSchema: 'not a schema' },
     ];
-    const tools = buildAgentTools(makeHost(), undefined, undefined, defs);
+    const tools = buildAgentTools(makeHost(), undefined, defs);
     // It still builds (no throw) and the tool is present.
     expect(tools['mcp__x__y' as keyof typeof tools].inputSchema).toBeDefined();
   });
@@ -179,5 +180,49 @@ describe('buildAgentTools', () => {
     const result = (await invoke(tools.read, {})) as { error?: boolean };
     expect(result).toMatchObject({ error: true });
     expect(host.calls).toHaveLength(0);
+  });
+});
+
+describe('buildPlannerTools', () => {
+  const question: ClarifyQuestion = {
+    question: 'Which feature do you mean?',
+    options: ['the API', 'the CLI'],
+    allowOther: true,
+  };
+
+  it('exposes read and search, and clarify only when the run offers it', () => {
+    // `clarify` is built when the run's offered tools include it (the client
+    // lists it when it can show the question pop-up), not from an injected seam.
+    expect(Object.keys(buildPlannerTools(makeHost())).sort()).toEqual(['read', 'search']);
+    const withClarify = makeHost('ok', ['read', 'search', 'clarify']);
+    expect(Object.keys(buildPlannerTools(withClarify)).sort()).toEqual([
+      'clarify',
+      'read',
+      'search',
+    ]);
+  });
+
+  it('delegates read and search to the host but never write/edit/run', async () => {
+    const host = makeHost('contents');
+    const tools = buildPlannerTools(host);
+    await expect(invoke(tools.read, { path: 'a.ts' })).resolves.toBe('contents');
+    await expect(invoke(tools.search, { query: '**/*.ts', mode: 'glob' })).resolves.toBe('contents');
+    expect(host.calls.map((c) => c.tool)).toEqual(['read', 'search']);
+    expect(tools).not.toHaveProperty('write');
+    expect(tools).not.toHaveProperty('edit');
+    expect(tools).not.toHaveProperty('run');
+  });
+
+  it('delegates the clarify tool to the host by name (the client composes the result)', async () => {
+    // `clarify` forwards { questions } to the host through the `tool` capability;
+    // the client puts them to the user and composes the answer string.
+    const host = makeHost('the user answered', ['read', 'search', 'clarify']);
+    const tools = buildPlannerTools(host);
+    const result = (await invoke(tools.clarify, { questions: [question] })) as string;
+
+    expect(result).toBe('the user answered');
+    expect(host.calls).toContainEqual(
+      expect.objectContaining({ tool: 'clarify', args: { questions: [question] } })
+    );
   });
 });

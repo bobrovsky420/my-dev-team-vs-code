@@ -8,7 +8,10 @@
     "llamacpp": { "endpoint": "", "requestsPerMinute": 0 },
     "openai": { "baseUrl": "", "requestsPerMinute": 0 },
     "anthropic": { "baseUrl": "", "requestsPerMinute": 0 },
-    "groq": { "baseUrl": "", "requestsPerMinute": 0 }
+    "groq": { "baseUrl": "", "requestsPerMinute": 0 },
+    "deepseek": { "baseUrl": "", "requestsPerMinute": 0 },
+    "zai": { "baseUrl": "", "requestsPerMinute": 0 },
+    "google": { "baseUrl": "", "requestsPerMinute": 0 }
   },
   "agents": {
     "triage": { "model": "ollama" }

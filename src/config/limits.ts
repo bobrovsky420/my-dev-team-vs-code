@@ -37,7 +37,7 @@ export const limits = {
   },
   executor: {
     /** Max model->tools->model iterations before the loop is cut off. */
-    maxSteps: 12,
+    maxSteps: 1000,
     /** Max characters of a tool call's argument JSON kept in the transcript. */
     inputPreviewMaxChars: 200,
     /** Max characters of a tool result kept in the transcript. */
@@ -46,6 +46,26 @@ export const limits = {
   skills: {
     /** Max characters of one skill body the executor inlines. */
     maxChars: 8_000,
+  },
+  compaction: {
+    /**
+     * Fraction of the compacter model's context window the conversation may fill
+     * in one pass. The rest is left for the summary the model writes and the
+     * prompt overhead, so a window-sized compaction cannot overflow. The
+     * compacter agent (see config/agents) prefers a big-window model, so on a
+     * large window this lets far more of the conversation be summarized than the
+     * client's coarse safety ceiling alone would.
+     */
+    inputWindowFraction: 0.6,
+    /**
+     * When the conversation does not fit one pass, it is summarized in a rolling
+     * refine: each later pass carries the briefing-so-far plus the next chunk.
+     * This fraction of the per-pass budget is reserved for the carried briefing,
+     * so the new chunk takes the rest - keeping briefing + chunk within the
+     * window. Only engaged on a window too small to hold the whole conversation
+     * (a big-window compacter summarizes in a single pass).
+     */
+    briefingReserveFraction: 0.4,
   },
   structuredOutput: {
     /**

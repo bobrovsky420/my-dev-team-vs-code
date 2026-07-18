@@ -43,31 +43,37 @@ function fakeContext() {
 }
 
 describe('activate', () => {
-  it('registers the five tools and creates the chat participant', () => {
+  it('creates the chat participant and registers no editor-wide tools', () => {
     const context = fakeContext();
     activate(context as any);
 
-    expect([...__state.registeredTools.keys()]).toHaveLength(5);
+    // The workspace tools are private to @devteam now: they are dispatched
+    // through the run's ClientHost, not contributed as editor-wide Language
+    // Model Tools, so nothing is registered with `vscode.lm.registerTool`.
+    expect([...__state.registeredTools.keys()]).toHaveLength(0);
     expect(chat.createChatParticipant).toHaveBeenCalledWith(
       'myDevTeam.agent',
       expect.any(Function)
     );
-    // The approval command + the plan-review command + the plan-preview seam
-    // (its content provider and the change emitter) + the MCP hub disposable +
-    // the run-mirror terminal + five tools + the participant, plus the unified
-    // status-bar button and its status-menu command, the engine-provider
-    // disposable, the select-model, set-api-key, and select-verbosity commands,
-    // the config-change listener, the show-usage command, the quick-question
-    // entry point (its command and the answer-preview provider and emitter),
-    // and the five editor entry points (three shim commands + the code-action
-    // and CodeLens providers), get pushed for disposal.
-    expect(context.subscriptions).toHaveLength(28);
+    // The debug output channel + the approval command + the plan-review command +
+    // the continue-review (check-in) command + the plan-preview seam (its content
+    // provider and the change emitter) + the MCP hub disposable + the run-mirror
+    // terminal + the participant, plus the unified status-bar button
+    // and its status-menu command, the engine-provider disposable, the
+    // select-model, set-api-key, select-verbosity, and select-triage-mode
+    // commands, the config-change listener, the show-usage command, the "Compact
+    // now" command, and the five editor entry points (three shim commands + the
+    // code-action and CodeLens providers), get pushed for disposal.
+    expect(context.subscriptions).toHaveLength(24);
     expect(__state.registeredCommands.has('myDevTeam.approval')).toBe(true);
+    expect(__state.registeredCommands.has('myDevTeam.compactNow')).toBe(true);
     expect(__state.registeredCommands.has('myDevTeam.planReview')).toBe(true);
+    expect(__state.registeredCommands.has('myDevTeam.continueReview')).toBe(true);
     expect(__state.registeredCommands.has('myDevTeam.statusMenu')).toBe(true);
     expect(__state.registeredCommands.has('myDevTeam.selectModel')).toBe(true);
     expect(__state.registeredCommands.has('myDevTeam.setApiKey')).toBe(true);
     expect(__state.registeredCommands.has('myDevTeam.selectVerbosity')).toBe(true);
+    expect(__state.registeredCommands.has('myDevTeam.selectTriageMode')).toBe(true);
     expect(__state.registeredCommands.has('myDevTeam.showUsage')).toBe(true);
     expect(__state.registeredCommands.has('myDevTeam.quickQuestion')).toBe(true);
     expect(__state.registeredCommands.has('myDevTeam.fixDiagnostic')).toBe(true);

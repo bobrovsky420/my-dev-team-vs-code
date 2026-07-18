@@ -12,7 +12,7 @@
 import * as vscode from 'vscode';
 import { limits } from './limits';
 import { providerDescriptors } from './providers';
-import { RuntimeConfig } from './runtimeConfig';
+import { RuntimeConfig, CustomModelInput } from './runtimeConfig';
 
 /** The settings namespace contributed in package.json. */
 const CONFIG_SECTION = 'myDevTeam';
@@ -49,17 +49,85 @@ export const defaults = {
   engine: 'local' as const,
   model: 'auto',
   triageModel: '',
+  triageMode: 'classifier' as const,
   complexityRouting: true,
   planApproval: 'auto' as const,
   planApprovalPreview: 'auto' as const,
   verbosity: 'verbose' as Verbosity,
+  attachActiveEditor: true,
   approval: {
     fileChanges: false,
   },
   disabledProviders: [] as readonly string[],
   disabledModels: [] as readonly string[],
+  customModels: [] as readonly CustomModelInput[],
   ollamaEndpoint: limits.defaultOllamaEndpoint,
   runCommandTimeoutMs: 60_000,
+  run: {
+    allowedCommands: [] as readonly string[],
+    /**
+     * The non-removable denylist floor for the `run` tool (always prompts,
+     * escalated to the destructive scope, regardless of the model's `dangerous`
+     * flag). `settings.run.deniedCommands` unions this with the user's
+     * `myDevTeam.run.deniedCommands` additions; the floor is in code, not the
+     * setting, so a user cannot shrink the safety net by clearing the setting.
+     * Two threat classes: irreversible/destructive commands and ones that reach
+     * the network (which could exfiltrate or fetch-and-run). Matching is
+     * case-insensitive, so the PowerShell cmdlets are caught however they are
+     * cased. The covered shells are the ones the run tool actually uses
+     * (config/environment.ts): PowerShell on Windows, /bin/sh elsewhere - hence
+     * both the POSIX names and the PowerShell cmdlets/aliases below (some POSIX
+     * names like `rm`/`del`/`curl` are also PowerShell aliases, so they double up).
+     */
+    deniedCommandsFloor: [
+      // POSIX / cross-platform destructive
+      'rm',
+      'rmdir',
+      'rd',
+      'del',
+      'dd',
+      'mkfs',
+      'format',
+      'sudo',
+      'doas',
+      'chmod',
+      'chown',
+      'shutdown',
+      'reboot',
+      // git history/state rewrites
+      'git push',
+      'git reset',
+      'git clean',
+      'git checkout',
+      'git rebase',
+      'npm publish',
+      // network (exfiltration / fetch-and-run)
+      'curl',
+      'wget',
+      'iwr',
+      'irm',
+      'invoke-webrequest',
+      'invoke-restmethod',
+      'start-bitstransfer',
+      // PowerShell destructive cmdlets (and their common aliases). Canonical
+      // Verb-Noun names cover the obscure short aliases; only the widely used
+      // aliases (`kill`) are listed on their own.
+      'remove-item',
+      'remove-itemproperty',
+      'clear-content',
+      'clear-item',
+      'set-content',
+      'stop-process',
+      'kill',
+      'stop-computer',
+      'restart-computer',
+      'format-volume',
+      'clear-disk',
+      // PowerShell arbitrary-code execution (the classic fetch | iex vector)
+      'invoke-expression',
+      'iex',
+    ] as readonly string[],
+  },
   read: {
     maxLines: 200,
   },
@@ -71,6 +139,16 @@ export const defaults = {
   chat: {
     toolSnippetLines: 5,
   },
+  executor: {
+    checkpointEverySteps: 100,
+    checkpointEverySeconds: 600,
+    contextWarnThresholds: [75, 85, 95] as readonly number[],
+  },
+  history: {
+    autoCompact: true,
+    autoCompactThreshold: 95,
+  },
+  modelContextWindows: {} as Readonly<Record<string, number>>,
   write: {
     protectedPaths: ['.vscode'],
   },
@@ -86,6 +164,9 @@ export const defaults = {
   thinking: {
     showInChat: true,
   },
+  clarify: {
+    enabled: true,
+  },
   instructions: {
     files: ['AGENTS.md', 'CLAUDE.md'],
   },
@@ -99,6 +180,7 @@ export const defaults = {
     evalLog: false,
     shadowTriage: false,
   },
+  debug: false,
 } as const;
 
 /** Read a user-set integer (at least `min`), falling back when unset or invalid. */
@@ -191,14 +273,31 @@ export const settings = {
    * What the quick triage step uses (`myDevTeam.triage.model`), kept separate
    * from `model` so the cheap classifier need not ride on the executor's model.
    * A registry id pins one model, "provider:<name>" routes within a provider,
-   * "auto" routes among all available models; empty (the default) defers to the
-   * build's `agents.triage.model` floor (the "ollama" provider unless changed).
-   * Read live and resolved in engine/core/models.ts (`triageRouting`), where the
-   * disable layers still apply - this can never reach a disabled provider/model.
+   * "auto" routes among all available models; empty (the default) cascades to the
+   * work model (`myDevTeam.model`) when that is concrete, then the build's
+   * `agents.triage.model` floor (the "ollama" provider unless changed). Read live
+   * and resolved in engine/core/models.ts (`triageRouting`), where the disable
+   * layers still apply - this can never reach a disabled provider/model.
    */
   get triageModel(): string {
     const value = vscode.workspace.getConfiguration(CONFIG_SECTION).get<unknown>('triage.model');
     return typeof value === 'string' ? value.trim() : defaults.triageModel;
+  },
+
+  /**
+   * How a request is routed (`myDevTeam.triage.mode`). `classifier` (the
+   * default) keeps the three-agent path: a cheap triage call routes the request,
+   * then the answerer or the planner runs. `combined` replaces that first call
+   * with a single responder that does triage and produces the answer or the plan
+   * in one model call - one fewer round-trip, and a request can never be
+   * misrouted into a dead-end answer (the same model that would answer decides to
+   * plan instead). Only the unpinned path changes: a slash command still pins the
+   * route and uses the dedicated agents. Read live; only the literal `combined`
+   * switches off `classifier`.
+   */
+  get triageMode(): 'classifier' | 'combined' {
+    const value = vscode.workspace.getConfiguration(CONFIG_SECTION).get<unknown>('triage.mode');
+    return value === 'combined' ? 'combined' : defaults.triageMode;
   },
 
   /**
@@ -265,6 +364,26 @@ export const settings = {
   },
 
   /**
+   * Whether the active editor is automatically attached as context on every
+   * @devteam request (`myDevTeam.attachActiveEditor`), so a bare "analyse the
+   * current file" / "explain this selection" has a referent without the user
+   * attaching anything: the whole open file, or just the selected text when
+   * there is a selection. On by default - mirroring how Copilot always includes
+   * the open editor - so the model never has to guess what "the current file"
+   * means. Turn it off to attach nothing implicitly (e.g. to keep a small local
+   * model's context window clear, or for privacy). Client-only: the engine just
+   * receives the resulting attachment, so it does not ride the runtime-config
+   * seam. Read live; anything but the literal `false` counts as on.
+   */
+  get attachActiveEditorEnabled(): boolean {
+    return (
+      vscode.workspace
+        .getConfiguration(CONFIG_SECTION)
+        .get<unknown>('attachActiveEditor') !== false
+    );
+  },
+
+  /**
    * Approval gates the user can switch on. Only `run` is gated unconditionally
    * (a shell command reaches outside the workspace and is not git-recoverable);
    * the file-changing tools are gated only when the user opts in here.
@@ -307,6 +426,55 @@ export const settings = {
    */
   get disabledModels(): readonly string[] {
     return userStringList('disabledModels');
+  },
+
+  /**
+   * Extra models the user registered (`myDevTeam.customModels`): a JSON array of
+   * model definitions (the same fields as a built-in model - id, label,
+   * provider, model, optional tier/capabilities), merged on top of the built-in
+   * registry so a newly released model can be used without republishing the
+   * extension. Only the shape is checked here (each entry must be a plain
+   * object); the full schema validation - provider must be one that is wired,
+   * ids must not collide with a built-in - lives in the engine (engine/config/
+   * models.ts), the single owner of the model schema, so it applies identically
+   * to the sidecar. A non-array (unset or wrong type) yields the empty list.
+   * Read live.
+   */
+  get customModels(): readonly CustomModelInput[] {
+    const value = vscode.workspace
+      .getConfiguration(CONFIG_SECTION)
+      .get<unknown>('customModels');
+    if (!Array.isArray(value)) {
+      return [];
+    }
+    return value.filter(
+      (entry): entry is CustomModelInput =>
+        typeof entry === 'object' && entry !== null && !Array.isArray(entry)
+    );
+  },
+
+  /**
+   * Per-model context-window overrides keyed by registry id
+   * (`myDevTeam.modelContextWindows`, e.g. `{ "qwen3-coder": 32768 }`). It wins
+   * over a model's built-in `contextWindow`, so a user can set the real window a
+   * local model was launched with (its `num_ctx`), which the built-in value -
+   * the theoretical maximum - cannot know. Only positive whole-number entries
+   * are kept; anything else is dropped.
+   */
+  get modelContextWindows(): Readonly<Record<string, number>> {
+    const value = vscode.workspace
+      .getConfiguration(CONFIG_SECTION)
+      .get<unknown>('modelContextWindows');
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+      return {};
+    }
+    const out: Record<string, number> = {};
+    for (const [id, n] of Object.entries(value as Record<string, unknown>)) {
+      if (typeof n === 'number' && Number.isFinite(n) && n > 0) {
+        out[id] = Math.floor(n);
+      }
+    }
+    return out;
   },
 
   /**
@@ -367,6 +535,33 @@ export const settings = {
   /** Shell command timeout for the `run` tool, in milliseconds (`myDevTeam.run.commandTimeoutMs`). */
   get runCommandTimeoutMs(): number {
     return userLimit('run.commandTimeoutMs', defaults.runCommandTimeoutMs);
+  },
+
+  /**
+   * The `run` tool's command policy (tools/commandPolicy.ts): which commands
+   * skip the approval prompt and which always prompt as destructive.
+   */
+  run: {
+    /**
+     * Prefix/glob patterns the user has marked safe to run without a prompt
+     * (`myDevTeam.run.allowedCommands`, e.g. `git status`, `npm test`,
+     * `npm run *`). Only a single, non-chained command can match; a denylisted
+     * command never does. Invalid entries (non-string or empty) are dropped, so
+     * one bad entry does not discard the rest. The "Always allow commands like
+     * this" approval choice appends to this list.
+     */
+    get allowedCommands(): readonly string[] {
+      return userStringList('run.allowedCommands');
+    },
+    /**
+     * The denylist that always prompts and is treated as destructive: the
+     * built-in floor (`defaults.run.deniedCommandsFloor`, not user-removable)
+     * unioned with the user's `myDevTeam.run.deniedCommands` additions. Patterns
+     * use the same prefix/glob form as the allowlist.
+     */
+    get deniedCommands(): readonly string[] {
+      return [...defaults.run.deniedCommandsFloor, ...userStringList('run.deniedCommands')];
+    },
   },
 
   /** Output buffer cap for the `run` tool, in bytes. */
@@ -477,6 +672,52 @@ export const settings = {
     get snippetLines(): number {
       return userLimit('chat.toolSnippetLines', defaults.chat.toolSnippetLines, 0);
     },
+    /**
+     * Steps between executor check-ins (`myDevTeam.executor.checkpointEverySteps`;
+     * 0 turns the step trigger off). The executor pauses and asks the user
+     * whether to keep going after this many tool-calling steps.
+     */
+    get checkpointEverySteps(): number {
+      return userLimit(
+        'executor.checkpointEverySteps',
+        defaults.executor.checkpointEverySteps,
+        0
+      );
+    },
+    /**
+     * Seconds between executor check-ins
+     * (`myDevTeam.executor.checkpointEverySeconds`; 0 turns the time trigger off).
+     * Whichever of steps/seconds is reached first triggers the check-in.
+     */
+    get checkpointEverySeconds(): number {
+      return userLimit(
+        'executor.checkpointEverySeconds',
+        defaults.executor.checkpointEverySeconds,
+        0
+      );
+    },
+    /**
+     * Context-usage warning thresholds, as percentages of a model's window
+     * (`myDevTeam.executor.contextWarnThresholds`). A notice fires once each time
+     * a run's context first crosses one. Cleaned to whole percents in (0, 100],
+     * de-duplicated and sorted ascending; an empty or all-invalid list falls back
+     * to the default, so the warnings cannot be silently lost to a typo.
+     */
+    get contextWarnThresholds(): readonly number[] {
+      const value = vscode.workspace
+        .getConfiguration(CONFIG_SECTION)
+        .get<unknown>('executor.contextWarnThresholds');
+      if (!Array.isArray(value)) {
+        return defaults.executor.contextWarnThresholds;
+      }
+      const cleaned = value
+        .filter(
+          (n): n is number => typeof n === 'number' && Number.isFinite(n) && n > 0 && n <= 100
+        )
+        .map((n) => Math.floor(n));
+      const unique = [...new Set(cleaned)].sort((a, b) => a - b);
+      return unique.length > 0 ? unique : defaults.executor.contextWarnThresholds;
+    },
   },
 
   /**
@@ -570,13 +811,14 @@ export const settings = {
 
   thinking: {
     /**
-     * Whether a reasoning model's thinking is surfaced live as transient
-     * progress while `@devteam` works (`myDevTeam.thinking.showInChat`). On by
-     * default. The engine condenses the model's verbose `<think>` output to its
-     * latest line before showing it, and never keeps it past the run. Like the
-     * summary flag this gates the work, not just the display: when off, the
-     * executor and answerer skip capturing reasoning entirely. Anything but the
-     * literal `false` counts as on.
+     * Whether a reasoning model's thinking is captured while `@devteam` works
+     * (`myDevTeam.thinking.showInChat`). On by default. The live "is reasoning"
+     * indicator is now VS Code's own built-in progress (the rotating
+     * "Thinking"/"Generating"/… verbs), shown whether or not this is on - we no
+     * longer emit a custom label or the reasoning text. What this gates is the
+     * work, like the summary flag: when off, the executor and answerer skip
+     * capturing reasoning entirely, so there is nothing to time and no "Thought
+     * for Ns" line either. Anything but the literal `false` counts as on.
      */
     get showInChatEnabled(): boolean {
       return (
@@ -585,8 +827,39 @@ export const settings = {
           .get<unknown>('thinking.showInChat') !== false
       );
     },
+    /**
+     * Whether to append a `_Thought for Ns_` line under a reply once a reasoning
+     * model has finished thinking (`myDevTeam.thinking.showDuration`). On by
+     * default. The time is measured client-side from the thinking it surfaces,
+     * so it shows nothing when `thinking.showInChat` is off (no reasoning was
+     * captured to time). Anything but the literal `false` counts as on.
+     */
+    get showDurationEnabled(): boolean {
+      return (
+        vscode.workspace
+          .getConfiguration(CONFIG_SECTION)
+          .get<unknown>('thinking.showDuration') !== false
+      );
+    },
     /** Re-exposed from config/limits.ts (the engine reads it from there). */
     lineMaxChars: limits.thinking.lineMaxChars,
+  },
+
+  clarify: {
+    /**
+     * Whether @devteam may end a run by asking a clarifying question instead of
+     * guessing on a genuinely ambiguous request (`myDevTeam.clarify.enabled`).
+     * On by default; this gates the route, not just the display - when off, the
+     * engine coerces a clarify decision to a normal answer so the run always
+     * produces work. Anything but the literal `false` counts as on.
+     */
+    get enabled(): boolean {
+      return (
+        vscode.workspace
+          .getConfiguration(CONFIG_SECTION)
+          .get<unknown>('clarify.enabled') !== false
+      );
+    },
   },
 
   /** The local eval log run/feedback records land in (client/evalLog.ts). */
@@ -621,6 +894,23 @@ export const settings = {
           .get<unknown>('telemetry.shadowTriage') === true
       );
     },
+  },
+
+  /**
+   * Whether debug logging is on (`myDevTeam.debug`). Off by default. When on,
+   * every layer of a run is traced to the "My Dev Team (Debug)" output channel:
+   * the client logs the client<->backend protocol traffic (the run request, the
+   * stream of run events, and every `invoke` inversion - a tool, a plan review,
+   * a check-in, a clarify, a skill body), and the engine logs each provider-API call (the raw request
+   * messages and the response) through the injected debug sink. Read live, so
+   * flipping it takes effect on the next request; only the literal `true` is on.
+   * Diagnostic only - the log is verbose and carries the run's raw content, all
+   * of which stays on the user's machine.
+   */
+  get debug(): boolean {
+    return (
+      vscode.workspace.getConfiguration(CONFIG_SECTION).get<unknown>('debug') === true
+    );
   },
 
   /**
@@ -808,6 +1098,54 @@ export const settings = {
     maxTurns: 10,
     /** Max characters of one prior turn's text inlined into the prompt. */
     maxTurnChars: 2_000,
+    /**
+     * Coarse safety ceiling on the characters of conversation the client ships
+     * for a /compact request - just so a runaway session cannot send an absurd
+     * payload. It is deliberately generous: the engine does the real, window-aware
+     * trim, sizing the input to the compacter model's context window (which
+     * prefers a big window), so this only ever caps the truly pathological case.
+     * Whole turns, untruncated, most-recent-first - far richer than the standing
+     * 10x2000 follow-up view the summary used to be built from.
+     */
+    compactInputMaxChars: 120_000,
+    /**
+     * Characters of a compaction summary preserved as the standing opening turn.
+     * Larger than `maxTurnChars` so the one turn that stands in for the whole
+     * earlier conversation is not re-truncated to a normal turn's size - that
+     * would throw away exactly the detail the compaction worked to keep.
+     */
+    compactSummaryMaxChars: 8_000,
+    /**
+     * Whether the conversation compacts itself automatically when its context
+     * nears the model's window (`myDevTeam.history.autoCompact`). On by default:
+     * once a run's context crosses `autoCompactThreshold`, the next turn first
+     * runs /compact and proceeds against the summary, so a long session cannot
+     * silently overflow. Off leaves the "Compact now" action the warnings offer
+     * as the only path. Read live; anything but the literal `false` counts as on.
+     */
+    get autoCompact(): boolean {
+      return (
+        vscode.workspace
+          .getConfiguration(CONFIG_SECTION)
+          .get<unknown>('history.autoCompact') !== false
+      );
+    },
+    /**
+     * Percent of the model's window at or above which auto-compaction triggers
+     * (`myDevTeam.history.autoCompactThreshold`). Below it, a crossed
+     * `executor.contextWarnThresholds` only offers a manual "Compact now"
+     * action; at or above it (with `autoCompact` on) the next turn compacts
+     * automatically. Cleaned to a whole percent in (0, 100], falling back to the
+     * default when unset or invalid so the trigger cannot be lost to a typo.
+     */
+    get autoCompactThreshold(): number {
+      const value = vscode.workspace
+        .getConfiguration(CONFIG_SECTION)
+        .get<unknown>('history.autoCompactThreshold');
+      return typeof value === 'number' && Number.isFinite(value) && value > 0 && value <= 100
+        ? Math.floor(value)
+        : defaults.history.autoCompactThreshold;
+    },
   },
 
   /** How long the activation health check waits for Ollama, in milliseconds (config/limits.ts). */
@@ -874,8 +1212,17 @@ export function liveRuntimeConfig(): RuntimeConfig {
     get disabledModels() {
       return settings.disabledModels;
     },
+    get customModels() {
+      return settings.customModels;
+    },
+    get workModel() {
+      return settings.model;
+    },
     get triageModel() {
       return settings.triageModel;
+    },
+    get triageMode() {
+      return settings.triageMode;
     },
     get complexityRoutingEnabled() {
       return settings.complexityRoutingEnabled;
@@ -886,6 +1233,18 @@ export function liveRuntimeConfig(): RuntimeConfig {
     get toolSnippetLines() {
       return settings.executor.snippetLines;
     },
+    get checkpointEverySteps() {
+      return settings.executor.checkpointEverySteps;
+    },
+    get checkpointEverySeconds() {
+      return settings.executor.checkpointEverySeconds;
+    },
+    get contextWarnThresholds() {
+      return settings.executor.contextWarnThresholds;
+    },
+    get modelContextWindows() {
+      return settings.modelContextWindows;
+    },
     get planApproval() {
       return settings.planApproval;
     },
@@ -894,6 +1253,12 @@ export function liveRuntimeConfig(): RuntimeConfig {
     },
     get summaryShowInChat() {
       return settings.summary.showInChatEnabled;
+    },
+    get clarifyEnabled() {
+      return settings.clarify.enabled;
+    },
+    get debugEnabled() {
+      return settings.debug;
     },
   };
 }
@@ -906,12 +1271,21 @@ export function runtimeConfigSnapshot(): RuntimeConfig {
     providerBaseUrls: live.providerBaseUrls,
     disabledProviders: [...live.disabledProviders],
     disabledModels: [...live.disabledModels],
+    customModels: [...live.customModels],
+    workModel: live.workModel,
     triageModel: live.triageModel,
+    triageMode: live.triageMode,
     complexityRoutingEnabled: live.complexityRoutingEnabled,
     requestsPerMinute: live.requestsPerMinute,
     toolSnippetLines: live.toolSnippetLines,
+    checkpointEverySteps: live.checkpointEverySteps,
+    checkpointEverySeconds: live.checkpointEverySeconds,
+    contextWarnThresholds: live.contextWarnThresholds,
+    modelContextWindows: live.modelContextWindows,
     planApproval: live.planApproval,
     thinkingShowInChat: live.thinkingShowInChat,
     summaryShowInChat: live.summaryShowInChat,
+    clarifyEnabled: live.clarifyEnabled,
+    debugEnabled: live.debugEnabled,
   };
 }

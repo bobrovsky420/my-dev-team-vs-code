@@ -60,6 +60,23 @@ describe('provider registry', () => {
     // A cloud provider: the model id passes through to the SDK instance.
     const openai = providerDescriptor('openai').build({ apiKey: 'k' });
     expect(openai('gpt-4.1').modelId).toBe('gpt-4.1');
+
+    // DeepSeek: another cloud provider, model id passes through.
+    const deepseek = providerDescriptor('deepseek').build({ apiKey: 'k' });
+    expect(deepseek('deepseek-v4-flash').modelId).toBe('deepseek-v4-flash');
+
+    // Z.AI: an OpenAI-compatible cloud provider, model id passes through (the
+    // Z.AI default endpoint is applied inside build, not the model id).
+    const zai = providerDescriptor('zai').build({ apiKey: 'k' });
+    expect(zai('glm-5.2').modelId).toBe('glm-5.2');
+  });
+
+  it('builds Z.AI on the Chat Completions transport (its endpoint has no Responses API)', () => {
+    // Z.AI reuses the OpenAI SDK but, like llama.cpp, must use `openai.chat`
+    // (provider id "openai.chat") rather than the SDK's default Responses
+    // transport, since the Z.AI endpoint only implements /chat/completions.
+    const zai = providerDescriptor('zai').build({ apiKey: 'k' });
+    expect(zai('glm-5.2').provider).toBe('openai.chat');
   });
 
   it('builds llama.cpp on the Chat Completions transport, not the Responses API', () => {

@@ -184,7 +184,9 @@ than introducing real I/O or network calls.
 After every change, propose a short, concise one-line commit message for the
 work, written in the repository's existing style (a sentence-case noun phrase,
 no conventional-commit prefix). Only propose it - never create the commit or
-apply it yourself unless the user explicitly asks.
+apply it yourself unless the user explicitly asks. When a turn makes no change
+to the repository (a question, an investigation, a read-only analysis), do not
+propose a commit message at all.
 
 ## No en/em dashes
 

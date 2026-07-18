@@ -607,6 +607,17 @@ export const window = {
 
   showInformationMessage: vi.fn(async (..._args: unknown[]): Promise<undefined> => undefined),
 
+  createOutputChannel: vi.fn((name: string) => ({
+    name,
+    append: vi.fn(),
+    appendLine: vi.fn(),
+    clear: vi.fn(),
+    show: vi.fn(),
+    hide: vi.fn(),
+    replace: vi.fn(),
+    dispose: vi.fn(),
+  })),
+
   createStatusBarItem: vi.fn((..._args: unknown[]): FakeStatusBarItem => {
     const item: FakeStatusBarItem = {
       text: '',

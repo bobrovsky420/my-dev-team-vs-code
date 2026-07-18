@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { StatusBar, STATUS_MENU_COMMAND_ID } from '../src/ui/statusBar';
 import { SELECT_MODEL_COMMAND_ID } from '../src/ui/modelCommands';
+import { SELECT_TRIAGE_MODE_COMMAND_ID } from '../src/ui/triageModeCommands';
 import { SHOW_USAGE_COMMAND_ID } from '../src/ui/usageView';
 import { Engine } from '../src/protocol/engine';
 import { ModelChoice } from '../src/protocol/types';
@@ -96,22 +97,60 @@ describe('StatusBar', () => {
     const tooltip = theItem().tooltip as MarkdownString;
     expect(tooltip).toBeInstanceOf(MarkdownString);
     expect(tooltip.supportThemeIcons).toBe(true);
-    // Trusted, but only for the three commands it links - nothing else.
+    // Trusted, but only for the commands it links - nothing else.
     expect(tooltip.isTrusted).toEqual({
       enabledCommands: [
         SELECT_MODEL_COMMAND_ID,
+        SELECT_TRIAGE_MODE_COMMAND_ID,
         SHOW_USAGE_COMMAND_ID,
         SET_API_KEY_COMMAND_ID,
       ],
     });
     expect(tooltip.value).toContain('Qwen3 Coder (Ollama)');
+    // The current output mode (verbosity) rides in the hover alongside the model.
+    expect(tooltip.value).toContain('Output mode: **Verbose**');
+    // The current routing (triage) mode rides in the hover too.
+    expect(tooltip.value).toContain('Routing: **Classifier**');
     // A separator under the title and another before the action links.
     expect((tooltip.value.match(/\n---\n/g) ?? []).length).toBe(2);
     expect(tooltip.value).toContain(`command:${SELECT_MODEL_COMMAND_ID}`);
+    expect(tooltip.value).toContain(`command:${SELECT_TRIAGE_MODE_COMMAND_ID}`);
     expect(tooltip.value).toContain(`command:${SHOW_USAGE_COMMAND_ID}`);
     expect(tooltip.value).toContain(`command:${SET_API_KEY_COMMAND_ID}`);
     // Each link carries a title so the hover shows meaningful text, not the URI.
     expect(tooltip.value).toContain('"Choose the model for @devteam"');
+    // With myDevTeam.debug off (the default), no debug line is shown.
+    expect(tooltip.value).not.toContain('Debug mode');
+  });
+
+  it('shows a "Debug mode: on" line in the hover only while myDevTeam.debug is on', () => {
+    __setConfig('myDevTeam.debug', true);
+    const bar = new StatusBar(fakeEngine(), STATUS_MENU_COMMAND_ID);
+    expect((theItem().tooltip as MarkdownString).value).toContain('Debug mode: **on**');
+
+    // Flipping it off and redrawing drops the line again.
+    __setConfig('myDevTeam.debug', false);
+    bar.redrawTooltip();
+    expect((theItem().tooltip as MarkdownString).value).not.toContain('Debug mode');
+  });
+
+  it('reflects the combined routing mode in the hover when the setting is set', async () => {
+    __setConfig('myDevTeam.triage.mode', 'combined');
+    const bar = new StatusBar(fakeEngine(), STATUS_MENU_COMMAND_ID);
+    const tooltip = theItem().tooltip as MarkdownString;
+    expect(tooltip.value).toContain('Routing: **Combined**');
+  });
+
+  it('offers a routing-mode row and runs select-triage-mode when picked', async () => {
+    __state.registeredCommands.set(SELECT_TRIAGE_MODE_COMMAND_ID, () => {});
+    const bar = new StatusBar(fakeEngine(), STATUS_MENU_COMMAND_ID);
+
+    __setQuickPickResponse(2); // model(0), usage(1), routing(2), output(3)
+    await bar.openMenu();
+
+    expect(lastMenuLabels()[2]).toContain('Routing mode');
+    expect(lastMenuLabels()[2]).toContain('Classifier');
+    expect(commands.executeCommand).toHaveBeenCalledWith(SELECT_TRIAGE_MODE_COMMAND_ID);
   });
 
   it('redraws the hover token total as runs accumulate', () => {

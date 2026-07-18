@@ -12,7 +12,7 @@ import { clientTools, clientToolNames } from '../src/protocol/toolContract';
 
 describe('protocol schemas', () => {
   it('pins the protocol version', () => {
-    expect(PROTOCOL_VERSION).toBe(3);
+    expect(PROTOCOL_VERSION).toBe(5);
   });
 
   it('accepts a minimal run request and rejects a malformed one', () => {
@@ -77,9 +77,17 @@ describe('protocol schemas', () => {
       ...planning,
       summary: { whatShips: 'a', howItsBuilt: 'b', testsAndDocs: 'c' },
     };
+    const clarify: Reply = {
+      intent: 'clarify',
+      reason: 'ambiguous',
+      questions: [
+        { question: 'Which one?', options: ['A', 'B'], allowOther: true },
+      ],
+    };
     expect(ReplySchema.parse(oneshot)).toEqual(oneshot);
     expect(ReplySchema.parse(planning)).toEqual(planning);
     expect(ReplySchema.parse(planningWithSummary)).toEqual(planningWithSummary);
+    expect(ReplySchema.parse(clarify)).toEqual(clarify);
     // A summary missing a section is malformed.
     expect(() =>
       ReplySchema.parse({ ...planning, summary: { whatShips: 'a' } })
@@ -249,15 +257,13 @@ describe('ReplyFolder', () => {
     ).toBeUndefined();
   });
 
-  it('reports no visual change for usage and tool-call events', () => {
+  it('reports no visual change for side-channel events (usage, thinking)', () => {
     const folder = new ReplyFolder();
     folder.apply({ type: 'triaged', intent: 'oneshot', reason: 'r' });
     expect(
       folder.apply({ type: 'usage', step: 'triage', inputTokens: 1 })
     ).toBeUndefined();
-    expect(
-      folder.apply({ type: 'tool-call', callId: '1', tool: 'read', args: {} })
-    ).toBeUndefined();
+    expect(folder.apply({ type: 'thinking', text: 'pondering' })).toBeUndefined();
     expect(
       folder.apply({ type: 'error', message: 'boom' } as RunEvent)
     ).toBeUndefined();
@@ -268,6 +274,22 @@ describe('ReplyFolder', () => {
     folder.apply({ type: 'triaged', intent: 'oneshot', reason: 'r' });
     folder.apply({ type: 'answer-delta', text: 'partial' });
     const reply: Reply = { intent: 'oneshot', reason: 'r', answer: 'complete' };
+    expect(folder.apply({ type: 'done', reply })).toEqual(reply);
+  });
+
+  it('folds a clarify reply, carrying its questions through on done', () => {
+    const folder = new ReplyFolder();
+    // The clarify route streams only the triage decision; the questions arrive
+    // whole in the final reply.
+    expect(folder.apply({ type: 'triaged', intent: 'clarify', reason: 'ambiguous' })).toEqual({
+      intent: 'clarify',
+      reason: 'ambiguous',
+    });
+    const reply: Reply = {
+      intent: 'clarify',
+      reason: 'ambiguous',
+      questions: [{ question: 'Which one?', options: ['A', 'B'], allowOther: false }],
+    };
     expect(folder.apply({ type: 'done', reply })).toEqual(reply);
   });
 });

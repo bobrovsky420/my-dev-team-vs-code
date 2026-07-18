@@ -1,8 +1,8 @@
 /**
  * Cloud-provider API keys, behind an injectable source so the engine can read
  * them in any process. The default source reads **environment variables only**
- * (`OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `GROQ_API_KEY`), which is what the
- * sidecar child uses - it has no `vscode`, and it inherits the parent's
+ * (`OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `GROQ_API_KEY` / `DEEPSEEK_API_KEY`),
+ * which is what the sidecar child uses - it has no `vscode`, and it inherits the parent's
  * environment, so nothing secret crosses the protocol.
  *
  * The in-process local engine runs in the extension host, which *does* have

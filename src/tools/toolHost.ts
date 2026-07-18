@@ -1,10 +1,12 @@
 /**
- * The extension's ToolHost: the one place a tool call from an engine (or from
- * the editor's Language Model Tools surface, see registerTools.ts) is
- * validated and dispatched onto the workspace implementations. Whichever
- * engine is selected - in-process today, remote later - the hands stay here:
- * file access, the shell, the approval gate, and the run mirror all live on
- * the user's machine, so an engine can only ever *ask* for a side effect.
+ * The extension's ToolHost: the one place a tool call from an engine is
+ * validated and dispatched onto the workspace implementations - the client half
+ * of the engine's tool inversion (the `tool` capability of the run's
+ * ClientHost). Whichever engine is selected - in-process today, remote later -
+ * the hands stay here: file access, the shell, the approval gate, and the run
+ * mirror all live on the user's machine, so an engine can only ever *ask* for a
+ * side effect. The tools are private to `@devteam`; they are not exposed as
+ * editor-wide Language Model Tools for other chat models to call.
  *
  * Dispatch is derived from the protocol's tool contract rather than written
  * out per tool: `handlers` carries one entry per `clientTools` name, and
@@ -12,8 +14,7 @@
  * it. There is no per-tool branch to keep in step with the contract - a tool
  * added to `clientTools` with no handler (or a handler reading the wrong
  * argument) is a compile error, so the name set cannot drift between the
- * contract, the host, and the editor registrations (registerTools.ts already
- * iterates the same contract and delegates here).
+ * contract and the host.
  */
 import { z } from 'zod';
 import { Approver, ChangeReporter, McpInvoker, RunMirror } from './types';
@@ -72,7 +73,8 @@ const handlers: ToolHandlers = {
     const results = await searchFiles(args.query, args.mode);
     return results.length ? results.join('\n') : '(no matches)';
   },
-  run: (args, ctx) => runCommand(args.command, ctx.approver, ctx.mirror, ctx.signal),
+  run: (args, ctx) =>
+    runCommand(args.command, ctx.approver, ctx.mirror, ctx.signal, args.dangerous),
   write: (args, ctx) =>
     writeFile(args.path, args.contents, ctx.signal, ctx.changes, ctx.approver),
   edit: (args, ctx) =>
@@ -121,12 +123,16 @@ export class WorkspaceToolHost implements ToolHost {
     // Forward the run's correlation id to the approval prompt without changing
     // every tool's signature: a thin wrapper tags each confirm with it, so a
     // gated tool calls `confirm(title, detail)` as before and the prompt still
-    // renders in the session that owns the run. Without an id (the editor-wide
-    // tool path) the real approver is used unwrapped.
+    // renders in the session that owns the run. Without an id (a run wired with
+    // no approval session, e.g. the internal compaction pass) the real approver
+    // is used unwrapped.
     const approver: Approver =
       correlationId === undefined
         ? this.approver
-        : { confirm: (title, detail) => this.approver.confirm(title, detail, correlationId) };
+        : {
+            confirm: (title, detail, scope, _correlationId, alwaysAllow) =>
+              this.approver.confirm(title, detail, scope, correlationId, alwaysAllow),
+          };
 
     // `hasOwnProperty`, not `in`, so an inherited name ("constructor") cannot
     // resolve to a handler.
@@ -153,9 +159,12 @@ export class WorkspaceToolHost implements ToolHost {
     // the tool's schema and validates the arguments, so the host forwards them
     // as given rather than re-validating against a contract it does not have.
     if (this.mcp?.has(tool)) {
+      // Scope "Allow All" to this exact MCP tool (the namespaced name), so
+      // approving every call to one server's tool never allows a sibling tool.
       const approved = await approver.confirm(
         messages.approval.mcpToolTitle,
-        messages.approval.mcpToolDetail(tool, mcpArgsPreview(args))
+        messages.approval.mcpToolDetail(tool, mcpArgsPreview(args)),
+        tool
       );
       if (!approved) {
         return messages.notApproved.mcp;

@@ -18,6 +18,7 @@ import * as vscode from 'vscode';
 import { Engine } from '../protocol/engine';
 import { LocalEngine } from '../engine/localEngine';
 import { SidecarEngine, createForkedChannel, traceChannel } from './sidecarEngine';
+import { DebugChannel, traceEngine } from './debugLog';
 import { SidecarChannel } from '../sidecar/transport';
 import { providersWithStoredKeyButNoEnv } from './secrets';
 import { providerDescriptor, providerLabels } from '../config/providers';
@@ -38,8 +39,16 @@ export interface EngineProvider {
  * sidecar engine. The LocalEngine and the SidecarEngine are each built once and
  * reused: agents are stateless between runs, and the provider wiring underneath
  * reacts to config changes on its own (the sidecar by a pushed refresh).
+ *
+ * `debug` is the "My Dev Team (Debug)" output channel: every engine `getEngine`
+ * hands out is wrapped with `traceEngine`, so when `myDevTeam.debug` is on the
+ * client<->backend protocol is logged there (whichever engine runs), and the
+ * sidecar additionally forwards its provider-API traffic to the same channel.
  */
-export function createEngineProvider(sidecarScriptPath: string): EngineProvider {
+export function createEngineProvider(
+  sidecarScriptPath: string,
+  debug: DebugChannel
+): EngineProvider {
   let local: LocalEngine | undefined;
   let sidecar: SidecarEngine | undefined;
   let warnedRemote = false;
@@ -73,7 +82,7 @@ export function createEngineProvider(sidecarScriptPath: string): EngineProvider 
         sidecarBlocked = true;
       }
     });
-    return new SidecarEngine(channel, runtimeConfigSnapshot);
+    return new SidecarEngine(channel, runtimeConfigSnapshot, (entry) => debug.write(entry));
   };
 
   // The sidecar child reads cloud keys from the environment only, so a key the
@@ -95,7 +104,9 @@ export function createEngineProvider(sidecarScriptPath: string): EngineProvider 
     void vscode.window.showWarningMessage(messages.engine.sidecarSecretKeysIgnored(list));
   };
 
-  const getEngine = (): Engine => {
+  // Pick the underlying engine for the live `myDevTeam.engine` setting; getEngine
+  // wraps it in the debug tracer so callers always get a traced engine.
+  const resolveEngine = (): Engine => {
     const choice = settings.engine;
     if (choice !== 'sidecar') {
       warnedSidecarSecrets = false;
@@ -125,6 +136,8 @@ export function createEngineProvider(sidecarScriptPath: string): EngineProvider 
     }
     return (local ??= new LocalEngine());
   };
+
+  const getEngine = (): Engine => traceEngine(resolveEngine(), debug);
 
   // Keep the sidecar's injected config live: re-send the snapshot whenever a
   // `myDevTeam.*` setting changes (the local engine reads `settings` directly).

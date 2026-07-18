@@ -7,15 +7,21 @@
  * same shapes in-process, so the client cannot tell the engines apart. Events
  * carry only user-visible content; deltas and per-event snapshots keep the
  * wire traffic linear in the reply size.
+ *
+ * This is a one-way stream: events flow engine->client and are never answered.
+ * The other direction - the engine asking the client to *do* something and
+ * waiting for a result (run a tool, approve a plan, a check-in, a clarifying
+ * question, a skill body) - is not an event; it crosses the `ClientHost.invoke`
+ * seam (see capabilities.ts), carried over the wire as its own request message.
  */
 import {
   Complexity,
+  ContextWarning,
   ExecutionEvent,
   Intent,
   ModelSelection,
   PartialPlan,
   PartialSummary,
-  Plan,
   Reply,
   ReplyProgress,
 } from './types';
@@ -91,6 +97,13 @@ export type RunEvent =
    */
   | { type: 'thinking'; text: string }
   /**
+   * A one-way caution that the run's context is filling the model's window,
+   * emitted once each time usage crosses a configured threshold. Like `thinking`
+   * it is a side-channel signal, never folded into a reply snapshot; a client
+   * that does not know it simply shows no context warning.
+   */
+  | { type: 'context-warning'; warning: ContextWarning }
+  /**
    * Transcript event `index` was appended or changed. Execution transcripts
    * are grow-only with only the last event still mutating (text grows, a tool
    * call gains its result), so re-sending one indexed event at a time keeps
@@ -103,23 +116,6 @@ export type RunEvent =
    * stream it comes from revises fields in place.
    */
   | { type: 'summary-snapshot'; summary: PartialSummary }
-  /**
-   * The engine asks the client to execute a tool and answer with a
-   * `ToolResultMessage` (see toolContract.ts). Only a remote engine emits
-   * this: the LocalEngine shares a process with the client and calls its
-   * ToolHost directly. Defined now because the event list is the part of the
-   * protocol that must not churn.
-   */
-  | { type: 'tool-call'; callId: string; tool: string; args: unknown }
-  /**
-   * The engine asks the client to approve the drafted plan before executing it,
-   * answered with a `PlanDecision` (see RunClient.reviewPlan). Like `tool-call`,
-   * only a remote engine emits it over the wire: the LocalEngine shares a
-   * process with the client and calls `reviewPlan` directly. Defined now so the
-   * event list stays stable. A client that does not know it simply never sees a
-   * gate (the engine then proceeds to execution).
-   */
-  | { type: 'plan-review'; plan: Plan; complexity: Complexity }
   /**
    * Metering record for one step's model call: the billing seam. A side is
    * omitted when neither the SDK reported it nor an estimate covers it;

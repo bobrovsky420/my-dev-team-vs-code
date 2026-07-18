@@ -21,45 +21,46 @@ beforeEach(() => {
 });
 
 describe('collectSkills', () => {
-  it('returns an empty array when no skill file exists', async () => {
-    expect(await collectSkills()).toEqual([]);
+  it('returns nothing when no skill file exists', async () => {
+    const { skills, bodies } = await collectSkills();
+    expect(skills).toEqual([]);
+    expect(bodies.size).toBe(0);
   });
 
-  it('reads a SKILL.md found under a workspace skills directory', async () => {
+  it('ships a SKILL.md found under a workspace dir as metadata, body served on demand', async () => {
     __setFile('.devteam/skills/demo/SKILL.md', SKILL('demo', 'do the thing'));
-    const skills = await collectSkills();
-    expect(skills).toHaveLength(1);
-    expect(skills[0].source).toBe('.devteam/skills/demo/SKILL.md');
-    expect(skills[0].text).toContain('name: demo');
-    expect(skills[0].text).toContain('do the thing');
+    const { skills, bodies } = await collectSkills();
+    expect(skills).toEqual([
+      { source: '.devteam/skills/demo/SKILL.md', name: 'demo', description: 'a skill' },
+    ]);
+    // The body never rides in the shipped metadata; it is kept for readSkill.
+    expect(bodies.get('demo')).toContain('do the thing');
   });
 
   it('reads a SKILL.md from the home directory, labelling its source with ~', async () => {
     __setFileAbs('/home/test/.claude/skills/personal/SKILL.md', SKILL('personal', 'home body'));
-    const skills = await collectSkills();
+    const { skills, bodies } = await collectSkills();
     expect(skills).toHaveLength(1);
     expect(skills[0].source).toBe('~/.claude/skills/personal/SKILL.md');
-    expect(skills[0].text).toContain('home body');
+    expect(skills[0].name).toBe('personal');
+    expect(bodies.get('personal')).toContain('home body');
   });
 
-  it('lists a workspace skill before a home skill of the same name (workspace wins)', async () => {
+  it('keeps the workspace skill over a home skill of the same name (workspace wins)', async () => {
     __setFile('.devteam/skills/demo/SKILL.md', SKILL('demo', 'workspace body'));
     __setFileAbs('/home/test/.devteam/skills/demo/SKILL.md', SKILL('demo', 'home body'));
-    const skills = await collectSkills();
-    // Both are shipped (the engine de-dups by name); the workspace one comes
-    // first so the engine keeps it.
-    expect(skills.map((s) => s.source)).toEqual([
-      '.devteam/skills/demo/SKILL.md',
-      '~/.devteam/skills/demo/SKILL.md',
-    ]);
-    expect(skills[0].text).toContain('workspace body');
+    const { skills, bodies } = await collectSkills();
+    // The client now de-dups by name (first-wins), so only the workspace skill
+    // ships and its body is the one served.
+    expect(skills.map((s) => s.source)).toEqual(['.devteam/skills/demo/SKILL.md']);
+    expect(bodies.get('demo')).toContain('workspace body');
   });
 
   it('scans every configured directory, in order', async () => {
     __setFileAbs('/home/test/.claude/skills/a/SKILL.md', SKILL('a', 'a'));
     __setFile('.claude/skills/b/SKILL.md', SKILL('b', 'b'));
     __setFile('.devteam/skills/c/SKILL.md', SKILL('c', 'c'));
-    const sources = (await collectSkills()).map((s) => s.source);
+    const sources = (await collectSkills()).skills.map((s) => s.source);
     // Workspace roots first (.devteam before .claude by the default list order),
     // then home.
     expect(sources).toEqual([
@@ -72,20 +73,22 @@ describe('collectSkills', () => {
   it('ignores a stray file directly under a skills directory', async () => {
     // A loose file (not in a <name>/ subfolder) is not a skill.
     __setFile('.devteam/skills/README.md', 'not a skill');
-    expect(await collectSkills()).toEqual([]);
+    expect((await collectSkills()).skills).toEqual([]);
   });
 
-  it('skips a folder without a SKILL.md and a blank SKILL.md', async () => {
+  it('skips a folder without a SKILL.md, a blank one, and one with no name', async () => {
     __setFile('.devteam/skills/empty/other.md', 'no skill file here');
     __setFile('.devteam/skills/blank/SKILL.md', '   \n\t\n');
-    expect(await collectSkills()).toEqual([]);
+    // A SKILL.md whose frontmatter lacks a name cannot be loaded, so it is dropped.
+    __setFile('.devteam/skills/noname/SKILL.md', '---\ndescription: x\n---\n\nbody');
+    expect((await collectSkills()).skills).toEqual([]);
   });
 
-  it('truncates an oversized skill file to the configured cap', async () => {
-    __setFile('.devteam/skills/big/SKILL.md', 'x'.repeat(settings.skills.maxChars + 500));
-    const skills = await collectSkills();
-    expect(skills[0].text.endsWith('(truncated)')).toBe(true);
-    expect(skills[0].text.length).toBeLessThanOrEqual(
+  it('truncates an oversized skill body to the configured cap', async () => {
+    __setFile('.devteam/skills/big/SKILL.md', SKILL('big', 'x'.repeat(settings.skills.maxChars + 500)));
+    const body = (await collectSkills()).bodies.get('big')!;
+    expect(body.endsWith('(truncated)')).toBe(true);
+    expect(body.length).toBeLessThanOrEqual(
       settings.skills.maxChars + '\n. . . (truncated)'.length
     );
   });
@@ -94,26 +97,26 @@ describe('collectSkills', () => {
     for (let i = 0; i <= settings.skills.maxSkills; i++) {
       __setFile(`.devteam/skills/s${i}/SKILL.md`, SKILL(`s${i}`, 'body'));
     }
-    expect(await collectSkills()).toHaveLength(settings.skills.maxSkills);
+    expect((await collectSkills()).skills).toHaveLength(settings.skills.maxSkills);
   });
 
   it('is disabled by an empty configured directory list', async () => {
     __setFile('.devteam/skills/demo/SKILL.md', SKILL('demo', 'body'));
     __setConfig('myDevTeam.skills.directories', []);
-    expect(await collectSkills()).toEqual([]);
+    expect((await collectSkills()).skills).toEqual([]);
   });
 
   it('still reads home skills when there is no workspace folder', async () => {
     __setFileAbs('/home/test/.devteam/skills/personal/SKILL.md', SKILL('personal', 'body'));
     __state.workspaceFolders = undefined;
-    const skills = await collectSkills();
+    const { skills } = await collectSkills();
     expect(skills.map((s) => s.source)).toEqual(['~/.devteam/skills/personal/SKILL.md']);
   });
 
-  it('returns an empty array when the home directory cannot be determined', async () => {
+  it('returns nothing when the home directory cannot be determined', async () => {
     homedirMock.mockReturnValue('');
     __state.workspaceFolders = undefined;
-    expect(await collectSkills()).toEqual([]);
+    expect((await collectSkills()).skills).toEqual([]);
   });
 });
 

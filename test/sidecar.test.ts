@@ -15,8 +15,18 @@ import {
   RunFailedError,
   RunCancelledError,
 } from '../src/protocol/engine';
-import { RunRequest, Reply, ModelChoice, PlanDecision, Plan } from '../src/protocol/types';
+import {
+  RunRequest,
+  Reply,
+  ModelChoice,
+  PlanDecision,
+  Plan,
+  ContinueDecision,
+  PROTOCOL_VERSION,
+} from '../src/protocol/types';
+import { makeClientHost } from '../src/protocol/capabilities';
 import { RuntimeConfig } from '../src/config/runtimeConfig';
+import { emitDebug, DebugEntry } from '../src/config/debugLog';
 
 /**
  * Wire a SidecarEngine to a child runtime hosting `engine`, entirely in-process
@@ -24,7 +34,10 @@ import { RuntimeConfig } from '../src/config/runtimeConfig';
  * exercised without spawning anything. Parent posts reach the child handler;
  * child posts reach the SidecarEngine's message handler.
  */
-function connect(engine: Engine): { sidecar: SidecarEngine; configs: RuntimeConfig[] } {
+function connect(
+  engine: Engine,
+  onDebug?: (entry: DebugEntry) => void
+): { sidecar: SidecarEngine; configs: RuntimeConfig[] } {
   const configs: RuntimeConfig[] = [];
   let onChildMessage: (m: ChildMessage) => void = () => {};
   const childHandle = createChildRuntime(
@@ -57,7 +70,7 @@ function connect(engine: Engine): { sidecar: SidecarEngine; configs: RuntimeConf
     thinkingShowInChat: true,
     summaryShowInChat: true,
   });
-  return { sidecar: new SidecarEngine(channel, getConfig), configs };
+  return { sidecar: new SidecarEngine(channel, getConfig, onDebug), configs };
 }
 
 const REPLY = { intent: 'planning', reason: 'r', answer: 'done' } as unknown as Reply;
@@ -103,16 +116,16 @@ describe('sidecar round trip', () => {
     const events: string[] = [];
     const handle = sidecar.startRun(request(), {
       onEvent: (e) => events.push(e.type),
-      toolHost: { tools: [], execute: async () => '' },
+      ...makeClientHost({ toolNames: [], executeTool: async () => '' }),
     });
     await expect(handle.result).resolves.toEqual(REPLY);
     expect(events).toEqual(['triaged', 'answer-delta', 'done']);
   });
 
-  it('inverts a tool call through the client toolHost', async () => {
+  it('inverts a tool call through the tool capability', async () => {
     const execute = vi.fn(async (tool: string) => `ran:${tool}`);
     const engine = new FakeEngine(async (_req, client) => {
-      const out = await client.toolHost.execute('read', { path: 'a.ts' });
+      const out = await client.invoke('tool', { tool: 'read', args: { path: 'a.ts' } });
       client.onEvent({ type: 'answer-delta', text: out });
       return REPLY;
     });
@@ -122,7 +135,7 @@ describe('sidecar round trip', () => {
       onEvent: (e) => {
         if (e.type === 'answer-delta') deltas.push(e.text);
       },
-      toolHost: { tools: ['read'], execute },
+      ...makeClientHost({ toolNames: ['read'], executeTool: execute }),
     });
     await handle.result;
     // The engine's tool call ran on the client side and the result came back.
@@ -130,10 +143,13 @@ describe('sidecar round trip', () => {
     expect(deltas).toEqual(['ran:read']);
   });
 
-  it('inverts a plan review through the client reviewPlan', async () => {
+  it('inverts a plan review through the reviewPlan capability', async () => {
     const reviewPlan = vi.fn(async (): Promise<PlanDecision> => ({ kind: 'approve' }));
     const engine = new FakeEngine(async (_req, client) => {
-      const decision = await client.reviewPlan!({ summary: 's', steps: [] } as unknown as Plan, 'complex');
+      const decision = await client.invoke('reviewPlan', {
+        plan: { summary: 's', steps: [] } as unknown as Plan,
+        complexity: 'complex',
+      });
       client.onEvent({ type: 'answer-delta', text: decision.kind });
       return REPLY;
     });
@@ -143,25 +159,68 @@ describe('sidecar round trip', () => {
       onEvent: (e) => {
         if (e.type === 'answer-delta') deltas.push(e.text);
       },
-      toolHost: { tools: [], execute: async () => '' },
-      reviewPlan,
+      ...makeClientHost({ toolNames: [], executeTool: async () => '', reviewPlan }),
     });
     await handle.result;
     expect(reviewPlan).toHaveBeenCalledWith(expect.objectContaining({ summary: 's' }), 'complex');
     expect(deltas).toEqual(['approve']);
   });
 
-  it('keeps two concurrent plan reviews for one run distinct (no resolver clobber)', async () => {
-    // Each review is keyed by its own id, so issuing two for one run resolves
-    // both; keying by runId alone would overwrite the first resolver and hang it.
+  it('inverts an executor check-in through the confirmContinue capability', async () => {
+    const confirmContinue = vi.fn(async (): Promise<ContinueDecision> => ({ kind: 'stop' }));
+    const engine = new FakeEngine(async (_req, client) => {
+      const decision = await client.invoke('confirmContinue', {
+        info: { stepsDone: 10, secondsElapsed: 42 },
+      });
+      client.onEvent({ type: 'answer-delta', text: decision.kind });
+      return REPLY;
+    });
+    const { sidecar } = connect(engine);
+    const deltas: string[] = [];
+    const handle = sidecar.startRun(request(), {
+      onEvent: (e) => {
+        if (e.type === 'answer-delta') deltas.push(e.text);
+      },
+      ...makeClientHost({ toolNames: [], executeTool: async () => '', confirmContinue }),
+    });
+    await handle.result;
+    expect(confirmContinue).toHaveBeenCalledWith(
+      expect.objectContaining({ stepsDone: 10, secondsElapsed: 42 })
+    );
+    expect(deltas).toEqual(['stop']);
+  });
+
+  it('does not advertise the check-in capability when the client lacks it', async () => {
+    const engine = new FakeEngine(async (_req, client) => {
+      expect(client.capabilities).not.toContain('confirmContinue');
+      return REPLY;
+    });
+    const { sidecar } = connect(engine);
+    const handle = sidecar.startRun(request(), {
+      onEvent: () => {},
+      ...makeClientHost({ toolNames: [], executeTool: async () => '' }),
+    });
+    await handle.result;
+  });
+
+  it('keeps two concurrent invokes for one run distinct (no resolver clobber)', async () => {
+    // Each invoke is keyed by its own call id, so issuing two for one run
+    // resolves both; keying by runId alone would overwrite the first resolver
+    // and hang it.
     const reviewPlan = vi.fn(
       async (_plan: Plan, complexity: string): Promise<PlanDecision> =>
         complexity === 'simple' ? { kind: 'approve' } : { kind: 'revise', comment: 'c' }
     );
     const engine = new FakeEngine(async (_req, client) => {
       const [a, b] = await Promise.all([
-        client.reviewPlan!({ summary: 'a', steps: [] } as unknown as Plan, 'simple'),
-        client.reviewPlan!({ summary: 'b', steps: [] } as unknown as Plan, 'complex'),
+        client.invoke('reviewPlan', {
+          plan: { summary: 'a', steps: [] } as unknown as Plan,
+          complexity: 'simple',
+        }),
+        client.invoke('reviewPlan', {
+          plan: { summary: 'b', steps: [] } as unknown as Plan,
+          complexity: 'complex',
+        }),
       ]);
       client.onEvent({ type: 'answer-delta', text: `${a.kind}/${b.kind}` });
       return REPLY;
@@ -172,40 +231,39 @@ describe('sidecar round trip', () => {
       onEvent: (e) => {
         if (e.type === 'answer-delta') deltas.push(e.text);
       },
-      toolHost: { tools: [], execute: async () => '' },
-      reviewPlan,
+      ...makeClientHost({ toolNames: [], executeTool: async () => '', reviewPlan }),
     });
     await handle.result;
     expect(deltas).toEqual(['approve/revise']);
   });
 
-  it('rejects a tool call left pending when the run settles', async () => {
-    // The engine fires a tool call but the run settles before the parent answers
-    // it: the child must reject the orphaned promise rather than leak it. The
-    // parent's toolHost never resolves, so only the run-settle cleanup can.
+  it('rejects an invoke left pending when the run settles', async () => {
+    // The engine fires a tool invoke but the run settles before the parent
+    // answers it: the child must reject the orphaned promise rather than leak it.
+    // The parent's host never resolves, so only the run-settle cleanup can.
     let toolPromise: Promise<string> | undefined;
     const engine = new FakeEngine(async (_req, client) => {
-      toolPromise = client.toolHost.execute('read', { path: 'a.ts' });
+      toolPromise = client.invoke('tool', { tool: 'read', args: { path: 'a.ts' } });
       return REPLY;
     });
     const { sidecar } = connect(engine);
     const handle = sidecar.startRun(request(), {
       onEvent: () => {},
-      toolHost: { tools: ['read'], execute: () => new Promise<string>(() => {}) },
+      ...makeClientHost({ toolNames: ['read'], executeTool: () => new Promise<string>(() => {}) }),
     });
     await handle.result;
     await expect(toolPromise!).rejects.toBeInstanceOf(RunCancelledError);
   });
 
-  it('does not offer the plan-review seam when the client lacks it', async () => {
+  it('does not advertise the plan-review capability when the client lacks it', async () => {
     const engine = new FakeEngine(async (_req, client) => {
-      expect(client.reviewPlan).toBeUndefined();
+      expect(client.capabilities).not.toContain('reviewPlan');
       return REPLY;
     });
     const { sidecar } = connect(engine);
     const handle = sidecar.startRun(request(), {
       onEvent: () => {},
-      toolHost: { tools: [], execute: async () => '' },
+      ...makeClientHost({ toolNames: [], executeTool: async () => '' }),
     });
     await expect(handle.result).resolves.toEqual(REPLY);
   });
@@ -217,7 +275,7 @@ describe('sidecar round trip', () => {
     const { sidecar } = connect(engine);
     const handle = sidecar.startRun(request(), {
       onEvent: () => {},
-      toolHost: { tools: [], execute: async () => '' },
+      ...makeClientHost({ toolNames: [], executeTool: async () => '' }),
     });
     const err = await handle.result.catch((e) => e as RunFailedError);
     expect(err).toBeInstanceOf(RunFailedError);
@@ -232,9 +290,28 @@ describe('sidecar round trip', () => {
     const { sidecar } = connect(engine);
     const handle = sidecar.startRun(request(), {
       onEvent: () => {},
-      toolHost: { tools: [], execute: async () => '' },
+      ...makeClientHost({ toolNames: [], executeTool: async () => '' }),
     });
     await expect(handle.result).rejects.toBeInstanceOf(RunCancelledError);
+  });
+
+  it('forwards the child engine debug entries to the parent onDebug', async () => {
+    // The child injects a debug sink that posts each entry over the wire; the
+    // parent hands it to onDebug, which the engine factory points at the output
+    // channel. An engine that emits during a run has its entry surfaced here.
+    const seen: DebugEntry[] = [];
+    const engine = new FakeEngine(async (_req, client) => {
+      emitDebug({ source: 'provider', label: 'request', detail: 'raw' });
+      client.onEvent({ type: 'done', reply: REPLY });
+      return REPLY;
+    });
+    const { sidecar } = connect(engine, (entry) => seen.push(entry));
+    const handle = sidecar.startRun(request(), {
+      onEvent: () => {},
+      ...makeClientHost({ toolNames: [], executeTool: async () => '' }),
+    });
+    await handle.result;
+    expect(seen).toContainEqual({ source: 'provider', label: 'request', detail: 'raw' });
   });
 
   it('round-trips listModels and startupWarnings', async () => {
@@ -289,7 +366,7 @@ const ready = (version: number): ChildMessage => ({
 function startBare(sidecar: SidecarEngine): Promise<Reply> {
   return sidecar.startRun(request(), {
     onEvent: () => {},
-    toolHost: { tools: [], execute: async () => '' },
+    ...makeClientHost({ toolNames: [], executeTool: async () => '' }),
   }).result;
 }
 
@@ -301,7 +378,7 @@ describe('sidecar readiness and version handshake', () => {
     // Config was sent, but no run started yet - the child has not said it is up.
     expect(posted.some((m) => m.t === 'start')).toBe(false);
 
-    emit(ready(3));
+    emit(ready(PROTOCOL_VERSION));
     await Promise.resolve();
     expect(posted.some((m) => m.t === 'start')).toBe(true);
   });
@@ -336,10 +413,10 @@ describe('sidecar readiness and version handshake', () => {
     const { sidecar, posted, emit } = manual();
     const handle = sidecar.startRun(request(), {
       onEvent: () => {},
-      toolHost: { tools: [], execute: async () => '' },
+      ...makeClientHost({ toolNames: [], executeTool: async () => '' }),
     });
     handle.cancel();
-    emit(ready(3));
+    emit(ready(PROTOCOL_VERSION));
     await expect(handle.result).rejects.toBeInstanceOf(RunCancelledError);
     expect(posted.some((m) => m.t === 'start')).toBe(false);
   });
@@ -378,19 +455,25 @@ describe('sidecar wire timeouts and probe failures', () => {
     expect(w[0]).toContain('ollama unreachable');
   });
 
-  it('answers an orphan tool-call (unknown run) with an error result', () => {
+  it('answers an orphan invoke (unknown run) with an error result', () => {
     const { posted, emit } = manual();
-    emit(ready(3));
-    emit({ t: 'tool-call', runId: 'run-unknown', callId: 'c1', tool: 'read', args: {} });
-    const result = posted.find((m) => m.t === 'tool-result');
+    emit(ready(PROTOCOL_VERSION));
+    emit({
+      t: 'invoke',
+      runId: 'run-unknown',
+      callId: 'c1',
+      capability: 'tool',
+      payload: { tool: 'read', args: {} },
+    });
+    const result = posted.find((m) => m.t === 'invoke-result');
     // Rather than dropping it (leaving the child's promise pending forever), the
     // parent answers with a failure so the child settles.
-    expect(result).toMatchObject({ t: 'tool-result', callId: 'c1', ok: false });
+    expect(result).toMatchObject({ t: 'invoke-result', callId: 'c1', ok: false });
   });
 
   it('fails pending runs and queries when the channel closes', async () => {
     const { sidecar, emit, close } = manual();
-    emit(ready(3));
+    emit(ready(PROTOCOL_VERSION));
     const run = startBare(sidecar);
     const models = sidecar.listModels();
     close('The engine sidecar exited unexpectedly (code 1).');

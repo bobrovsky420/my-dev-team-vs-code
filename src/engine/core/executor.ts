@@ -1,14 +1,22 @@
 import { Agent } from '@mastra/core/agent';
-import { resolveModel, routeModel } from './models';
+import type { ModelMessage } from 'ai';
+import { contextWindowFor, resolveModel, routeModel } from './models';
 import {
   buildAgentTools,
   renderDynamicToolsSection,
   PROGRESS_TOOL,
   ProgressReportSchema,
 } from './agentTools';
-import { resolveTokenCounts, UsageReporter } from './usage';
+import { estimateTokenCounts, readUsage, UsageReporter } from './usage';
+import {
+  runToolLoop,
+  CheckpointPrompt,
+  ContextWarningSink,
+  StreamBatch,
+} from './toolLoop';
 import { condenseThinking } from './thinking';
 import { agents } from '../config/agents';
+import { withSteering } from '../config/steering';
 import { toolConfigs } from '../config/tools';
 import { limits } from '../../config/limits';
 import { runtimeConfig } from '../../config/runtimeConfig';
@@ -21,6 +29,8 @@ import {
 } from '../../protocol/types';
 import { Complexity } from '../../protocol/types';
 import { ToolHost } from '../../protocol/toolContract';
+
+export type { CheckpointPrompt, ContextWarningSink } from './toolLoop';
 
 export { ExecutionSchema } from '../../protocol/types';
 export type { ExecutionEvent, PartialExecution } from '../../protocol/types';
@@ -45,6 +55,18 @@ export type ExecutionProgress = (partial: PartialExecution) => void;
  * signal, not part of what the run produced. Must not throw.
  */
 export type ThinkingProgress = (line: string) => void;
+
+/**
+ * The wrap-up instruction appended to the conversation when execution is cut
+ * short - by the user choosing "stop" at a check-in, or by hitting the step
+ * ceiling - so the run ends with a real, in-context answer drawn from the work
+ * already done rather than an abrupt, resultless cut-off. Streamed with tools
+ * turned off so the model can only conclude, not start more work.
+ */
+const FINALIZE_INSTRUCTION =
+  'Stop here and do not call any more tools. Based on everything you have ' +
+  'gathered so far, give your best answer and conclusion now, noting briefly ' +
+  'anything you did not get to.';
 
 function truncate(text: string, max: number): string {
   return text.length > max ? text.slice(0, max) + '…' : text;
@@ -113,6 +135,10 @@ function resultPreview(result: unknown): string {
  */
 export class Executor {
   private readonly modelName: string;
+  /** Registry id of the routed model, for the context-window lookup. */
+  private readonly modelId: string;
+  /** Display label of the routed model, shown in a context warning. */
+  private readonly modelLabel: string;
   private readonly agent: Agent;
   /**
    * The current run's cancellation signal, set for the duration of `execute`.
@@ -135,31 +161,25 @@ export class Executor {
     toolHost: ToolHost,
     modelPin?: string,
     complexity?: Complexity,
-    // The per-run skill bodies the executor's `skill` tool returns by name
-    // (built-in + workspace skills, resolved by the workflow's execute step).
-    skillBodies?: ReadonlyMap<string, string>,
     // The run's MCP tools (discovered client-side, shipped on the request).
     // Each becomes a tool proxy, and they are listed in an extra prompt section
     // so the model knows they exist alongside the built-in tools.
     dynamicTools?: readonly DynamicToolDef[]
   ) {
-    this.modelName = routeModel(
-      agents.executor.capabilities,
-      modelPin,
-      undefined,
-      complexity
-    ).model;
+    const routed = routeModel(agents.executor.capabilities, modelPin, undefined, complexity);
+    this.modelName = routed.model;
+    this.modelId = routed.id;
+    this.modelLabel = routed.label;
     const dynamicSection = renderDynamicToolsSection(dynamicTools ?? []);
-    const instructions = dynamicSection
-      ? `${agents.executor.instructions}\n\n${dynamicSection}`
-      : agents.executor.instructions;
+    const steered = withSteering(agents.executor.instructions, routed);
+    const instructions = dynamicSection ? `${steered}\n\n${dynamicSection}` : steered;
     this.agent = new Agent({
       id: agents.executor.id,
       name: agents.executor.name,
       description: agents.executor.description,
       instructions,
       model: resolveModel(agents.executor.capabilities, modelPin, undefined, complexity),
-      tools: buildAgentTools(toolHost, () => this.currentSignal, skillBodies, dynamicTools),
+      tools: buildAgentTools(toolHost, () => this.currentSignal, dynamicTools),
     });
   }
 
@@ -168,11 +188,21 @@ export class Executor {
     onPartial?: ExecutionProgress,
     signal?: AbortSignal,
     onUsage?: UsageReporter,
-    onThinking?: ThinkingProgress
+    onThinking?: ThinkingProgress,
+    onCheckpoint?: CheckpointPrompt,
+    onContextWarning?: ContextWarningSink
   ): Promise<ExecutionResult> {
     this.currentSignal = signal;
     try {
-      return await this.run(prompt, onPartial, signal, onUsage, onThinking);
+      return await this.run(
+        prompt,
+        onPartial,
+        signal,
+        onUsage,
+        onThinking,
+        onCheckpoint,
+        onContextWarning
+      );
     } finally {
       this.currentSignal = undefined;
     }
@@ -183,19 +213,10 @@ export class Executor {
     onPartial: ExecutionProgress | undefined,
     signal: AbortSignal | undefined,
     onUsage: UsageReporter | undefined,
-    onThinking: ThinkingProgress | undefined
+    onThinking: ThinkingProgress | undefined,
+    onCheckpoint: CheckpointPrompt | undefined,
+    onContextWarning: ContextWarningSink | undefined
   ): Promise<ExecutionResult> {
-    // Forward the signal so Mastra stops the tool-calling loop when the request
-    // is cancelled; only add it when present so the no-signal call still passes
-    // exactly { maxSteps } to the model.
-    const options: { maxSteps: number; abortSignal?: AbortSignal } = {
-      maxSteps: limits.executor.maxSteps,
-    };
-    if (signal) {
-      options.abortSignal = signal;
-    }
-    const output = await this.agent.stream([{ role: 'user', content: prompt }], options);
-
     const events: ExecutionEvent[] = [];
     // Tool results arrive by call id, possibly after further chunks; map the
     // id back to the event the matching tool-call chunk created.
@@ -209,108 +230,165 @@ export class Executor {
     // ephemeral status signal, not part of the transcript the run produced.
     let reasoning = '';
 
-    // Drain the full chunk stream: reading it is what drives the tool-calling
-    // loop to completion, so this runs even when nobody listens.
-    const reader = output.fullStream.getReader();
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) {
-        break;
-      }
-      const chunk = value as { type: string; payload?: any };
-      switch (chunk.type) {
-        // A reasoning model streams its `<think>` monologue as reasoning chunks
-        // (Mastra surfaces them as `reasoning-delta`/`reasoning`). Condense the
-        // buffer to its latest line and forward it as live thinking; never push
-        // it to `events`, so it stays out of the transcript. Skipped entirely
-        // when nobody is listening (the setting is off).
-        case 'reasoning-delta':
-        case 'reasoning': {
-          if (onThinking) {
-            const delta: string = chunk.payload?.text ?? '';
-            if (delta) {
-              reasoning += delta;
-              const line = condenseThinking(reasoning, limits.thinking.lineMaxChars);
-              if (line) {
-                onThinking(line);
+    // Drain one batch's full chunk stream into the shared transcript: reading it
+    // is what drives that batch's tool-calling loop to completion, so this runs
+    // even when nobody listens to `onPartial`. Throws on an `error` chunk so a
+    // broken run fails the step (the UI then renders the executor error).
+    const drainBatch = async (stream: ReadableStream<unknown>): Promise<void> => {
+      const reader = stream.getReader();
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) {
+          break;
+        }
+        const chunk = value as { type: string; payload?: any };
+        switch (chunk.type) {
+          // A reasoning model streams its `<think>` monologue as reasoning chunks
+          // (Mastra surfaces them as `reasoning-delta`/`reasoning`). Condense the
+          // buffer to its latest line and forward it as live thinking; never push
+          // it to `events`, so it stays out of the transcript. Skipped entirely
+          // when nobody is listening (the setting is off).
+          case 'reasoning-delta':
+          case 'reasoning': {
+            if (onThinking) {
+              const delta: string = chunk.payload?.text ?? '';
+              if (delta) {
+                reasoning += delta;
+                const line = condenseThinking(reasoning, limits.thinking.lineMaxChars);
+                if (line) {
+                  onThinking(line);
+                }
               }
             }
-          }
-          break;
-        }
-        case 'text-delta': {
-          const delta: string = chunk.payload?.text ?? '';
-          if (!delta) {
             break;
           }
-          const last = events[events.length - 1];
-          if (last?.kind === 'text') {
-            last.text += delta;
-          } else {
-            events.push({ kind: 'text', text: delta });
+          case 'text-delta': {
+            const delta: string = chunk.payload?.text ?? '';
+            if (!delta) {
+              break;
+            }
+            const last = events[events.length - 1];
+            if (last?.kind === 'text') {
+              last.text += delta;
+            } else {
+              events.push({ kind: 'text', text: delta });
+            }
+            emit();
+            break;
           }
-          emit();
-          break;
-        }
-        case 'tool-call': {
-          const tool = String(chunk.payload?.toolName ?? '');
-          // The progress tool is engine-only: rather than a transcript tool
-          // call, its arguments become a `progress` checklist event. A
-          // malformed or empty report is dropped (it only fails to render,
-          // never the run), and its result chunk is ignored below because it
-          // was never put in `pendingCalls`.
-          if (tool === PROGRESS_TOOL) {
-            const parsed = ProgressReportSchema.safeParse(chunk.payload?.args);
-            if (parsed.success && parsed.data.items.length > 0) {
-              events.push({ kind: 'progress', items: parsed.data.items });
+          case 'tool-call': {
+            const tool = String(chunk.payload?.toolName ?? '');
+            // The progress tool is engine-only: rather than a transcript tool
+            // call, its arguments become a `progress` checklist event. A
+            // malformed or empty report is dropped (it only fails to render,
+            // never the run), and its result chunk is ignored below because it
+            // was never put in `pendingCalls`.
+            if (tool === PROGRESS_TOOL) {
+              const parsed = ProgressReportSchema.safeParse(chunk.payload?.args);
+              if (parsed.success && parsed.data.items.length > 0) {
+                events.push({ kind: 'progress', items: parsed.data.items });
+                emit();
+              }
+              break;
+            }
+            const snippet = inputSnippet(tool, chunk.payload?.args);
+            const event = {
+              kind: 'tool' as const,
+              tool,
+              input: inputPreview(tool, chunk.payload?.args),
+              ...(snippet === undefined ? {} : { snippet }),
+            };
+            events.push(event);
+            pendingCalls.set(String(chunk.payload?.toolCallId ?? ''), event);
+            emit();
+            break;
+          }
+          case 'tool-result': {
+            const event = pendingCalls.get(String(chunk.payload?.toolCallId ?? ''));
+            if (event) {
+              event.result = resultPreview(chunk.payload?.result);
+              if (chunk.payload?.isError) {
+                event.failed = true;
+              }
               emit();
             }
             break;
           }
-          const snippet = inputSnippet(tool, chunk.payload?.args);
-          const event = {
-            kind: 'tool' as const,
-            tool,
-            input: inputPreview(tool, chunk.payload?.args),
-            ...(snippet === undefined ? {} : { snippet }),
-          };
-          events.push(event);
-          pendingCalls.set(String(chunk.payload?.toolCallId ?? ''), event);
-          emit();
-          break;
-        }
-        case 'tool-result': {
-          const event = pendingCalls.get(String(chunk.payload?.toolCallId ?? ''));
-          if (event) {
-            event.result = resultPreview(chunk.payload?.result);
-            if (chunk.payload?.isError) {
+          case 'tool-error': {
+            const event = pendingCalls.get(String(chunk.payload?.toolCallId ?? ''));
+            if (event) {
+              event.result = resultPreview(
+                chunk.payload?.error instanceof Error
+                  ? chunk.payload.error.message
+                  : chunk.payload?.error
+              );
               event.failed = true;
+              emit();
             }
-            emit();
+            break;
           }
-          break;
-        }
-        case 'tool-error': {
-          const event = pendingCalls.get(String(chunk.payload?.toolCallId ?? ''));
-          if (event) {
-            event.result = resultPreview(
-              chunk.payload?.error instanceof Error
-                ? chunk.payload.error.message
-                : chunk.payload?.error
-            );
-            event.failed = true;
-            emit();
+          case 'error': {
+            // The run itself broke (model unreachable, stream aborted…); fail
+            // the step so the UI renders the executor error with the hint.
+            const error = chunk.payload?.error;
+            throw error instanceof Error ? error : new Error(String(error));
           }
-          break;
-        }
-        case 'error': {
-          // The run itself broke (model unreachable, stream aborted…); fail
-          // the step so the UI renders the executor error with the hint.
-          const error = chunk.payload?.error;
-          throw error instanceof Error ? error : new Error(String(error));
         }
       }
-    }
+    };
+
+    // One batch: stream the model over the carried messages, drain its chunks
+    // into the transcript, and report the metadata the loop aggregates. Reading
+    // the response and usage is best-effort - a provider that surfaces neither
+    // must never fail the run the work already produced.
+    const streamBatch: StreamBatch = async (messages, control) => {
+      const options: Record<string, unknown> = {};
+      if (agents.executor.modelSettings) {
+        options.modelSettings = agents.executor.modelSettings;
+      }
+      if (control.stopWhen !== undefined) {
+        options.stopWhen = control.stopWhen;
+      }
+      if (control.toolChoice !== undefined) {
+        options.toolChoice = control.toolChoice;
+      }
+      if (control.signal) {
+        options.abortSignal = control.signal;
+      }
+      const output = await this.agent.stream(messages, options as never);
+      await drainBatch(output.fullStream as ReadableStream<unknown>);
+      let responseMessages: ModelMessage[] = [];
+      try {
+        const response = (await output.response) as { messages?: ModelMessage[] };
+        if (Array.isArray(response?.messages)) {
+          responseMessages = response.messages;
+        }
+      } catch {
+        // No response messages to carry; the next batch re-sends what we have.
+      }
+      const counts = await readUsage(output);
+      let steps = 0;
+      let finishReason: string | undefined;
+      try {
+        steps = (await output.steps)?.length ?? 0;
+        finishReason = await output.finishReason;
+      } catch {
+        // Treat missing metadata as a cut-off batch (not a natural finish).
+      }
+      return { steps, finishReason, counts, responseMessages };
+    };
+
+    const { totals, anyReported } = await runToolLoop({
+      prompt,
+      streamBatch,
+      finalizeInstruction: FINALIZE_INSTRUCTION,
+      lastActionLabel: () => lastActionLabel(events),
+      signal,
+      onCheckpoint,
+      contextWindow: onContextWarning ? contextWindowFor(this.modelId) : undefined,
+      modelLabel: this.modelLabel,
+      onContextWarning,
+    });
 
     // The transcript's text events are the model's prose output; join them as
     // the reply estimate for when the SDK reports no counts.
@@ -319,11 +397,26 @@ export class Executor {
       .join('');
     onUsage?.({
       model: this.modelName,
-      ...(await resolveTokenCounts(output, prompt, replyText)),
+      ...(anyReported ? totals : estimateTokenCounts(prompt, replyText)),
     });
 
     // Validate rather than cast, mirroring the planner: a malformed transcript
     // fails here with a schema error instead of rendering broken markdown.
     return ExecutionSchema.parse({ events });
   }
+}
+
+/**
+ * A short label of the most recent action for a check-in prompt: the last
+ * transcript tool call's name, or undefined when none has happened yet (so the
+ * prompt can omit it rather than show an empty value).
+ */
+function lastActionLabel(events: readonly ExecutionEvent[]): string | undefined {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const event = events[i];
+    if (event.kind === 'tool') {
+      return event.tool;
+    }
+  }
+  return undefined;
 }

@@ -10,7 +10,9 @@ import {
   selectModel,
 } from '../src/engine/config/models';
 import { parseFrontmatter } from '../src/engine/config/frontmatter';
-import { agents } from '../src/engine/config/agents';
+import { agents, buildInstructions } from '../src/engine/config/agents';
+import { partials, resolveIncludes } from '../src/engine/config/partials';
+import { CLARIFY_GUIDANCE } from '../src/engine/core/clarify';
 import {
   loadTools,
   toolConfigs,
@@ -90,7 +92,11 @@ describe('messages templates', () => {
     expect(messages.editFailed.notFound('a.ts')).toMatch(/read the file/i);
     expect(messages.editFailed.multipleMatches(3, 'a.ts')).toContain('3');
     expect(messages.editFailed.multipleMatches(3, 'a.ts')).toMatch(/surrounding/);
+    // Identical old/new text must not read as a no-op success (which lets the
+    // executor stop) - it nudges recovery: re-read/retry or use the write tool.
     expect(messages.editFailed.identical).toMatch(/identical/);
+    expect(messages.editFailed.identical).toMatch(/write tool/);
+    expect(messages.editFailed.identical).not.toMatch(/nothing to change/);
   });
 
   it('renders the in-chat approval question with the detail fenced', () => {
@@ -132,7 +138,9 @@ describe('messages templates', () => {
     expect(messages.execution.result('ok', false)).toBe(' → `ok`');
     expect(messages.execution.result('boom', true)).toBe(' → **failed** `boom`');
     expect(messages.execution.emptyResult).toBeTruthy();
-    expect(messages.execution.header).toBe('**Execution:**');
+    expect(messages.execution.header()).toBe('**Execution:**');
+    // The executor's model rides in the header when known, as an italic suffix.
+    expect(messages.execution.header('Qwen3 8B')).toBe('**Execution:** _(Qwen3 8B)_');
   });
 
   it('warns about the not-yet-available remote engine by name', () => {
@@ -312,6 +320,70 @@ describe('user-tunable settings (VS Code configuration)', () => {
     expect(settings.executor.snippetLines).toBe(defaults.chat.toolSnippetLines);
   });
 
+  it('reads the executor check-in intervals live, accepting 0 to disable each', () => {
+    expect(settings.executor.checkpointEverySteps).toBe(defaults.executor.checkpointEverySteps);
+    expect(settings.executor.checkpointEverySeconds).toBe(defaults.executor.checkpointEverySeconds);
+    __setConfig('myDevTeam.executor.checkpointEverySteps', 5);
+    expect(settings.executor.checkpointEverySteps).toBe(5);
+    __setConfig('myDevTeam.executor.checkpointEverySteps', 0);
+    expect(settings.executor.checkpointEverySteps).toBe(0);
+    __setConfig('myDevTeam.executor.checkpointEverySeconds', 30);
+    expect(settings.executor.checkpointEverySeconds).toBe(30);
+    __setConfig('myDevTeam.executor.checkpointEverySeconds', 0);
+    expect(settings.executor.checkpointEverySeconds).toBe(0);
+    // Negative is invalid and falls back to the default.
+    __setConfig('myDevTeam.executor.checkpointEverySteps', -1);
+    expect(settings.executor.checkpointEverySteps).toBe(defaults.executor.checkpointEverySteps);
+  });
+
+  it('cleans the context-warn thresholds: drops out-of-range, de-dupes, sorts', () => {
+    expect(settings.executor.contextWarnThresholds).toEqual(
+      defaults.executor.contextWarnThresholds
+    );
+    __setConfig('myDevTeam.executor.contextWarnThresholds', [95, 80, 80, 0, 150, 90]);
+    expect(settings.executor.contextWarnThresholds).toEqual([80, 90, 95]);
+    // An empty or all-invalid list falls back to the default.
+    __setConfig('myDevTeam.executor.contextWarnThresholds', [0, -5, 200]);
+    expect(settings.executor.contextWarnThresholds).toEqual(
+      defaults.executor.contextWarnThresholds
+    );
+  });
+
+  it('reads auto-compact, defaulting on and off only for the literal false', () => {
+    expect(settings.history.autoCompact).toBe(defaults.history.autoCompact);
+    expect(settings.history.autoCompact).toBe(true);
+    __setConfig('myDevTeam.history.autoCompact', false);
+    expect(settings.history.autoCompact).toBe(false);
+    // Anything but the literal false counts as on.
+    __setConfig('myDevTeam.history.autoCompact', 'no');
+    expect(settings.history.autoCompact).toBe(true);
+  });
+
+  it('cleans the auto-compact threshold to a whole percent in (0,100]', () => {
+    expect(settings.history.autoCompactThreshold).toBe(defaults.history.autoCompactThreshold);
+    __setConfig('myDevTeam.history.autoCompactThreshold', 88.6);
+    expect(settings.history.autoCompactThreshold).toBe(88);
+    // Out of range or non-numeric falls back to the default.
+    __setConfig('myDevTeam.history.autoCompactThreshold', 0);
+    expect(settings.history.autoCompactThreshold).toBe(defaults.history.autoCompactThreshold);
+    __setConfig('myDevTeam.history.autoCompactThreshold', 150);
+    expect(settings.history.autoCompactThreshold).toBe(defaults.history.autoCompactThreshold);
+  });
+
+  it('keeps only positive whole-number per-model context-window overrides', () => {
+    expect(settings.modelContextWindows).toEqual({});
+    __setConfig('myDevTeam.modelContextWindows', {
+      'qwen3-coder': 32768,
+      'bad-zero': 0,
+      'bad-text': 'nope',
+      'rounds-down': 8192.7,
+    });
+    expect(settings.modelContextWindows).toEqual({
+      'qwen3-coder': 32768,
+      'rounds-down': 8192,
+    });
+  });
+
   it('accepts only the literal "remote" for the engine and falls back otherwise', () => {
     __setConfig('myDevTeam.engine', 'remote');
     expect(settings.engine).toBe('remote');
@@ -435,12 +507,36 @@ describe('user-tunable settings (VS Code configuration)', () => {
     __setConfig('myDevTeam.write.protectedPaths', [42]);
     expect(settings.write.protectedPaths).toEqual(defaults.write.protectedPaths);
   });
+
+  it('reads the run allowlist, empty by default and dropping invalid entries', () => {
+    expect(settings.run.allowedCommands).toEqual([]);
+    __setConfig('myDevTeam.run.allowedCommands', ['npm test', 'git status']);
+    expect(settings.run.allowedCommands).toEqual(['npm test', 'git status']);
+    // Non-string / blank entries are dropped, the rest kept; a non-array is empty.
+    __setConfig('myDevTeam.run.allowedCommands', ['ok', '', 42]);
+    expect(settings.run.allowedCommands).toEqual(['ok']);
+    __setConfig('myDevTeam.run.allowedCommands', 'npm test');
+    expect(settings.run.allowedCommands).toEqual([]);
+  });
+
+  it('unions the run denylist additions with the non-removable floor', () => {
+    // The floor is always present, even with nothing configured.
+    expect(settings.run.deniedCommands).toEqual(defaults.run.deniedCommandsFloor);
+    __setConfig('myDevTeam.run.deniedCommands', ['terraform apply']);
+    expect(settings.run.deniedCommands).toContain('terraform apply');
+    for (const entry of defaults.run.deniedCommandsFloor) {
+      expect(settings.run.deniedCommands).toContain(entry);
+    }
+    // Clearing the setting cannot shrink the floor.
+    __setConfig('myDevTeam.run.deniedCommands', []);
+    expect(settings.run.deniedCommands).toEqual(defaults.run.deniedCommandsFloor);
+  });
 });
 
 describe('model registry and selection', () => {
   it('registers models with provider, model name, and at least one capability', () => {
-    expect(modelRegistry.length).toBeGreaterThan(0);
-    for (const info of modelRegistry) {
+    expect(modelRegistry().length).toBeGreaterThan(0);
+    for (const info of modelRegistry()) {
       expect(info.id).toBeTruthy();
       expect(info.label).toBeTruthy();
       expect(info.provider).toBeTruthy();
@@ -450,7 +546,7 @@ describe('model registry and selection', () => {
   });
 
   it('keeps registry ids unique', () => {
-    const ids = modelRegistry.map((info) => info.id);
+    const ids = modelRegistry().map((info) => info.id);
     expect(new Set(ids).size).toBe(ids.length);
   });
 
@@ -470,7 +566,7 @@ describe('model registry and selection', () => {
   });
 
   it('keeps every capability score within [0, 1]', () => {
-    for (const info of modelRegistry) {
+    for (const info of modelRegistry()) {
       for (const score of Object.values(info.capabilities)) {
         expect(score).toBeGreaterThanOrEqual(0);
         expect(score).toBeLessThanOrEqual(1);
@@ -484,10 +580,12 @@ describe('model registry and selection', () => {
       provider: 'ollama',
       model: 'x',
       description: '',
-      capabilities: { reasoning: 0.5, speed: 1 },
+      capabilities: { reasoning: 0.5, 'fast-utility': 1 },
     } as const;
-    // 0.8 * 0.5 (reasoning) + 0.2 * 1 (speed) + 1 * 0 (coding, unscored)
-    expect(scoreModel(info, { reasoning: 0.8, speed: 0.2, coding: 1 })).toBeCloseTo(0.6);
+    // 0.8 * 0.5 (reasoning) + 0.2 * 1 (fast-utility) + 1 * 0 (code-generation, unscored)
+    expect(
+      scoreModel(info, { reasoning: 0.8, 'fast-utility': 0.2, 'code-generation': 1 })
+    ).toBeCloseTo(0.6);
   });
 
   it('selects the registered model with the highest weighted score', () => {
@@ -499,30 +597,44 @@ describe('model registry and selection', () => {
     ]) {
       const selected = selectModel(requirements);
       const best = Math.max(
-        ...modelRegistry.map((info) => scoreModel(info, requirements))
+        ...modelRegistry().map((info) => scoreModel(info, requirements))
       );
       expect(scoreModel(selected, requirements)).toBe(best);
     }
   });
 
   it('routes triage to a faster model than the planner cares about', () => {
-    // The point of capability routing: triage (speed-weighted) and planning
-    // (reasoning-weighted) should be free to land on different models.
+    // The point of capability routing: triage (fast-utility-weighted) and
+    // planning (reasoning-weighted) should be free to land on different models.
     const triageModel = selectModel(agents.triage.capabilities);
     const plannerModel = selectModel(agents.planner.capabilities);
-    expect((triageModel.capabilities.speed ?? 0)).toBeGreaterThanOrEqual(
-      plannerModel.capabilities.speed ?? 0
+    expect(triageModel.capabilities['fast-utility'] ?? 0).toBeGreaterThanOrEqual(
+      plannerModel.capabilities['fast-utility'] ?? 0
     );
   });
 
-  it('routes the executor to the strongest coding model in the registry', () => {
-    // The executor weights coding hardest, so it must land on the registry's
-    // code specialist rather than a generalist.
+  it('routes the executor to the strongest code-generation model in the registry', () => {
+    // The executor weights code-generation hardest, so it must land on the
+    // registry's code specialist rather than a generalist.
     const executorModel = selectModel(agents.executor.capabilities);
     const bestCoding = Math.max(
-      ...modelRegistry.map((info) => info.capabilities.coding ?? 0)
+      ...modelRegistry().map((info) => info.capabilities['code-generation'] ?? 0)
     );
-    expect(executorModel.capabilities.coding).toBe(bestCoding);
+    expect(executorModel.capabilities['code-generation']).toBe(bestCoding);
+  });
+
+  it('normalises the legacy coding/speed dialect to the unified names', () => {
+    // A user's hand-written custom model may predate the unified vocabulary:
+    // `coding` expands to both code capabilities, `speed` to fast-utility, and
+    // an explicit unified name wins over the alias expansion.
+    const file =
+      '---\nid: legacy\nlabel: L\nprovider: ollama\nmodel: l:1b\ncapabilities:\n  coding: 0.8\n  speed: 0.6\n  code-analysis: 0.4\n---\nnote';
+    const [info] = loadModels([file]);
+    expect(info.capabilities).toEqual({
+      'code-generation': 0.8,
+      'code-analysis': 0.4,
+      'fast-utility': 0.6,
+    });
   });
 });
 
@@ -540,6 +652,21 @@ describe('parseFrontmatter', () => {
       '---\nsideEffecting: true\nenabled: false\nlimit: 8\n---\nbody'
     );
     expect(data).toEqual({ sideEffecting: true, enabled: false, limit: 8 });
+  });
+
+  it('parses numbers written with _ digit separators', () => {
+    const { data } = parseFrontmatter(
+      '---\ncontextWindow: 200_000\nbig: 1_047_576\nfrac: 1_000.5\n---\nbody'
+    );
+    expect(data).toEqual({ contextWindow: 200000, big: 1047576, frac: 1000.5 });
+  });
+
+  it('leaves malformed separator forms as strings, not numbers', () => {
+    // Underscores must sit between digits; a stray one is not a number.
+    const { data } = parseFrontmatter(
+      '---\na: 1_\nb: _1\nc: 1__0\nd: v1_2\n---\nbody'
+    );
+    expect(data).toEqual({ a: '1_', b: '_1', c: '1__0', d: 'v1_2' });
   });
 
   it('parses block lists', () => {
@@ -620,9 +747,10 @@ describe('environment', () => {
 });
 
 describe('tool configs', () => {
-  it('discovers the five workspace tools plus the engine-only progress and skill tools', () => {
+  it('discovers the five workspace tools plus the engine-only progress, skill, and clarify tools', () => {
     // Order follows the config filenames, so compare as a sorted set.
     expect([...toolNames].sort()).toEqual([
+      'clarify',
       'edit',
       'progress',
       'read',
@@ -631,10 +759,13 @@ describe('tool configs', () => {
       'skill',
       'write',
     ]);
-    // progress and skill are engine-only: the executor carries them, the planner
-    // never lists them (plan steps no longer name a tool at all).
+    // progress and skill are engine-only and carried by the executor; clarify is
+    // engine-built and carried by the planner. Neither agent lists the other's
+    // engine-only tools, and plan steps no longer name a tool at all.
     expect(agents.executor.tools).toContain('progress');
     expect(agents.executor.tools).toContain('skill');
+    expect(agents.executor.tools).not.toContain('clarify');
+    expect(agents.planner.tools).toContain('clarify');
     expect(agents.planner.tools).not.toContain('progress');
     expect(agents.planner.tools).not.toContain('skill');
   });
@@ -653,15 +784,15 @@ describe('tool configs', () => {
     // The engine's workspace tool configs (model-facing) and the protocol's
     // client tools (ids, display names, input schemas) describe the same five
     // tools; a tool added on one side only would silently break the other. The
-    // engine-only progress and skill tools have no client contract.
+    // engine-only progress, skill, and clarify tools have no client contract.
     const workspaceTools = toolNames.filter(
-      (name) => name !== 'progress' && name !== 'skill'
+      (name) => name !== 'progress' && name !== 'skill' && name !== 'clarify'
     );
     expect([...workspaceTools].sort()).toEqual([...clientToolNames].sort());
     expect(clientToolNames).not.toContain('progress');
     expect(clientToolNames).not.toContain('skill');
+    expect(clientToolNames).not.toContain('clarify');
     for (const name of clientToolNames) {
-      expect(clientTools[name].lmToolId).toBe(`devteam__${name}`);
       expect(clientTools[name].displayName).toBeTruthy();
     }
   });
@@ -748,7 +879,7 @@ describe('agent configs', () => {
 
   it('keeps the summarizer toolless, fast, and asking for the three sections', () => {
     expect(agents.summarizer.tools).toEqual([]);
-    expect(agents.summarizer.capabilities.speed).toBeGreaterThan(0);
+    expect(agents.summarizer.capabilities['fast-utility']).toBeGreaterThan(0);
     const p = agents.summarizer.instructions;
     expect(p).toContain('whatShips');
     expect(p).toContain('howItsBuilt');
@@ -774,19 +905,29 @@ describe('agent configs', () => {
     expect(agents.planner.capabilities.planning).toBe(1);
   });
 
-  it('weights the answerer toward reasoning with speed close behind', () => {
+  it('weights the answerer toward reasoning with fast-utility close behind', () => {
     expect(agents.answerer.capabilities.reasoning).toBe(1);
-    expect(agents.answerer.capabilities.speed).toBeGreaterThan(0);
+    expect(agents.answerer.capabilities['fast-utility']).toBeGreaterThan(0);
   });
 
-  it('weights the executor toward coding', () => {
-    expect(agents.executor.capabilities.coding).toBe(1);
+  it('weights the executor toward code generation', () => {
+    expect(agents.executor.capabilities['code-generation']).toBe(1);
+  });
+
+  it('derives modelSettings from the sampling frontmatter, absent when unset', () => {
+    // Triage pins a low temperature for stable routing; agents without
+    // sampling keys carry no modelSettings, keeping provider defaults.
+    expect(agents.triage.modelSettings).toEqual({ temperature: 0.1 });
+    expect(agents.executor.modelSettings).toBeUndefined();
+    expect(agents.answerer.modelSettings).toBeUndefined();
   });
 
   it('keeps the executor contract: all tools, decline handling, a report', () => {
-    // The executor carries every tool, including the engine-only progress and
-    // skill tools.
-    expect([...agents.executor.tools].sort()).toEqual([...toolNames].sort());
+    // The executor carries every tool except the planner-only `clarify`,
+    // including the engine-only progress and skill tools.
+    expect([...agents.executor.tools].sort()).toEqual(
+      [...toolNames].filter((name) => name !== 'clarify').sort()
+    );
     const p = agents.executor.instructions;
     expect(p).not.toContain('{{tools}}');
     expect(p).toContain('You have exactly 7 tools available:');
@@ -798,6 +939,21 @@ describe('agent configs', () => {
     // It is told it can load a skill on demand.
     expect(p).toContain('"skill"');
     expect(p).toContain('Available skills');
+  });
+
+  it('gives the executor coding discipline: verify, deps, secrets, scope', () => {
+    const p = agents.executor.instructions;
+    // Verify a change and stop looping on a persistent failure.
+    expect(p).toMatch(/verify it/i);
+    expect(p).toMatch(/loop on the same failure/i);
+    // Confirm a dependency exists; never hardcode a secret.
+    expect(p).toMatch(/do not assume a library/i);
+    expect(p).toMatch(/never hardcode a secret/i);
+    // Stay in scope and do not create unneeded files/docs.
+    expect(p).toMatch(/stay within the request/i);
+    expect(p).toMatch(/documentation file on\s+your own/i);
+    // Use the file tools rather than shelling out to read/edit files.
+    expect(p).toMatch(/dedicated tools for files, not the run tool/i);
   });
 
   it('tells the run-capable agents which OS and shell they work on', () => {
@@ -862,27 +1018,33 @@ describe('agent configs', () => {
     expect(p).toMatch(/JSON object/i);
   });
 
-  it('keeps triage routing any file-changing request to planning, however small', () => {
+  it('routes a small, fully-specified change to "direct" and larger ones to "planning"', () => {
     const p = agents.triage.instructions;
-    // The boundary is the deliverable: a created/changed file means planning.
-    expect(p).toMatch(/create or change a file/);
-    expect(p).toMatch(/even if/);
-    // A trivial new-script request is an explicit planning example: without
-    // it a small model reads "needs no exploration" as oneshot and the user
-    // gets fenced code in chat instead of a written file.
+    // The three routes are all present and explained.
+    expect(p).toContain('"oneshot"');
+    expect(p).toContain('"direct"');
+    expect(p).toContain('"planning"');
+    // The direct/planning boundary: small-and-clear is direct; multi-file,
+    // exploration-needing, or design-open work is planning. When unsure, plan.
+    expect(p).toMatch(/small and\s+fully-specified|small.*fully-specified/s);
+    expect(p).toMatch(/when in doubt/i);
+    // A trivial new-script request is still an explicit planning example: it
+    // creates a whole file, so it is not a "direct" few-line change.
     expect(p).toContain('create a python script');
   });
 
-  it('keeps the planner contract: the five workspace tools, the step cap, and JSON output', () => {
-    // The planner is grounded in the workspace tools (so it plans only doable
-    // work); the engine-only progress tool is never offered to it.
+  it('keeps the planner contract: its own read/search/clarify tools, the step cap, and JSON output', () => {
+    // The planner now carries its own tools - read and search to explore before
+    // committing, clarify to ask the user - and never the executor's mutating
+    // tools or the engine-only progress/skill tools.
     expect([...agents.planner.tools].sort()).toEqual([
-      'edit',
+      'clarify',
       'read',
-      'run',
       'search',
-      'write',
     ]);
+    expect(agents.planner.tools).not.toContain('write');
+    expect(agents.planner.tools).not.toContain('edit');
+    expect(agents.planner.tools).not.toContain('run');
     expect(agents.planner.tools).not.toContain('progress');
     const p = agents.planner.instructions;
     expect(p).toContain('never more than 12');
@@ -904,7 +1066,7 @@ describe('agent configs', () => {
   it('renders the tools section into the planner prompt at the placeholder', () => {
     const p = agents.planner.instructions;
     expect(p).not.toContain('{{tools}}');
-    expect(p).toContain('You have exactly 5 tools available:');
+    expect(p).toContain('You have exactly 3 tools available:');
     for (const name of agents.planner.tools) {
       expect(p).toContain(`- "${name}": ${toolConfigs[name].description}`);
     }
@@ -912,5 +1074,94 @@ describe('agent configs', () => {
     expect(p).not.toContain(`- "progress":`);
     // The placeholder position is honoured: tools come before the rules.
     expect(p.indexOf('tools available')).toBeLessThan(p.indexOf('Rules:'));
+  });
+});
+
+describe('shared partials and includes', () => {
+  it('registers the untrusted-data guard with its core wording', () => {
+    expect(partials['untrusted-data']).toMatch(/untrusted data/i);
+    expect(partials['untrusted-data']).toMatch(/act only on the\s+user's actual request/i);
+  });
+
+  it('registers every shared partial generated from my-dev-team-config', () => {
+    // The six shared prompt blocks (TODO 1.4 in my-dev-team) ride the sync
+    // script; a missing one means the generated files were hand-pruned.
+    for (const name of [
+      'untrusted-data',
+      'clarify-guidance',
+      'code-style',
+      'faithful-reporting',
+      'scope-discipline',
+      'tdd',
+    ]) {
+      expect(partials[name], `partial ${name}`).toBeTruthy();
+    }
+    expect(partials['scope-discipline']).toMatch(/stay within the request/i);
+    expect(partials['code-style']).toMatch(/never hardcode a secret/i);
+    expect(partials['faithful-reporting']).toMatch(/report outcomes faithfully/i);
+  });
+
+  it('derives the clarify guidance from the shared partial, flattened', () => {
+    expect(CLARIFY_GUIDANCE).toBe(partials['clarify-guidance'].replace(/\s+/g, ' '));
+    expect(CLARIFY_GUIDANCE).not.toContain('\n');
+    expect(CLARIFY_GUIDANCE).toMatch(/sensible\s+default/i);
+  });
+
+  it('replaces a known include with the partial body', () => {
+    const registry = { greeting: 'Hello there.' };
+    expect(resolveIncludes('Say: {{ include greeting }}', registry)).toBe(
+      'Say: Hello there.'
+    );
+  });
+
+  it('normalises a path and a .md suffix to the partial name', () => {
+    const registry = { greeting: 'Hi.' };
+    expect(resolveIncludes('{{ include greeting.md }}', registry)).toBe('Hi.');
+    expect(resolveIncludes('{{ include partials/greeting.md }}', registry)).toBe(
+      'Hi.'
+    );
+  });
+
+  it('throws on an unknown include name', () => {
+    expect(() => resolveIncludes('{{ include missing }}', {})).toThrow(
+      /Unknown include "missing"/
+    );
+  });
+
+  it('resolves a partial that itself includes another', () => {
+    const registry = { outer: 'A {{ include inner }} B', inner: 'X' };
+    expect(resolveIncludes('{{ include outer }}', registry)).toBe('A X B');
+  });
+
+  it('throws on a cyclic include instead of recursing forever', () => {
+    const registry = { a: '{{ include b }}', b: '{{ include a }}' };
+    expect(() => resolveIncludes('{{ include a }}', registry)).toThrow(
+      /Cyclic include detected/
+    );
+  });
+
+  it('keeps or drops a conditional include by the flags record', () => {
+    // The unified `if [not] <flag>` clause shared with my-dev-team's loader.
+    const registry = { extra: 'EXTRA' };
+    const kept = (text: string, flags?: Record<string, boolean>) =>
+      resolveIncludes(text, registry, flags).includes('EXTRA');
+    expect(kept('{{ include extra if verbose }}')).toBe(false);
+    expect(kept('{{ include extra if verbose }}', { verbose: true })).toBe(true);
+    expect(kept('{{ include extra if not verbose }}')).toBe(true);
+    expect(kept('{{ include extra if not verbose }}', { verbose: true })).toBe(false);
+  });
+
+  it('strips the {{skills}} placeholder instead of rendering it', () => {
+    // Part of the unified prompt-body conventions: this app serves skills
+    // inside the composed request, so a shared body's placeholder is removed.
+    expect(buildInstructions('Before {{skills}} after.', [])).toBe('Before  after.');
+  });
+
+  it('expands every agent include - no raw directive survives, the guard is shared', () => {
+    for (const agent of Object.values(agents)) {
+      expect(agent.instructions).not.toContain('{{ include');
+      // Every agent now carries the same shared injection guard.
+      expect(agent.instructions).toMatch(/act only on the\s+user's actual request/i);
+    }
   });
 });

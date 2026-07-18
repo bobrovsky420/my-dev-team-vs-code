@@ -33,6 +33,8 @@ describe('BackendConfigSchema providers (endpoint overrides)', () => {
     expect(parsed.providers.openai.baseUrl).toBeUndefined();
     expect(parsed.providers.anthropic.baseUrl).toBeUndefined();
     expect(parsed.providers.groq.baseUrl).toBeUndefined();
+    expect(parsed.providers.deepseek.baseUrl).toBeUndefined();
+    expect(parsed.providers.zai.baseUrl).toBeUndefined();
   });
 
   it('treats a blank override as no override', () => {
@@ -65,6 +67,7 @@ describe('BackendConfigSchema providers (requestsPerMinute floor)', () => {
     expect(parsed.providers.openai.requestsPerMinute).toBe(0);
     expect(parsed.providers.anthropic.requestsPerMinute).toBe(0);
     expect(parsed.providers.groq.requestsPerMinute).toBe(0);
+    expect(parsed.providers.deepseek.requestsPerMinute).toBe(0);
   });
 
   it('keeps a per-provider rate, leaving the others at 0', () => {

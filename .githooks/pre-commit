@@ -1,0 +1,42 @@
+#!/bin/sh
+# Blocks a commit when the generated model catalogue (engine/config/models/*.md)
+# or the generated shared prompt partials (engine/config/partials/*.md) have
+# drifted from their sources in the sibling my-dev-team-config checkout.
+# Skips silently when that checkout is absent (CI, other machines).
+# Activate once per clone with:
+#   git config core.hooksPath .githooks
+root="$(git rev-parse --show-toplevel)"
+config_repo="$root/../my-dev-team-config"
+[ -f "$config_repo/scripts/sync_models.py" ] || exit 0
+
+# The check needs a Python with PyYAML; a bare `python` on PATH may be a clean
+# system install without it (the hook does not inherit an activated venv).
+# Prefer the sibling my-dev-team venv, where PyYAML is a dependency.
+find_python() {
+    for candidate in \
+        "$root/../my-dev-team/venv/Scripts/python.exe" "$root/../my-dev-team/venv/bin/python" \
+        "$root/../my-dev-team/.venv/Scripts/python.exe" "$root/../my-dev-team/.venv/bin/python" \
+        python3 python py; do
+        if "$candidate" -c "import yaml" >/dev/null 2>&1; then
+            echo "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+if ! python_bin="$(find_python)"; then
+    echo "pre-commit: skipping the model-registry drift check - no Python with PyYAML found." >&2
+    echo "Install it with: pip install pyyaml" >&2
+    exit 0
+fi
+
+for script in sync_models.py sync_partials.py; do
+    if ! "$python_bin" "$config_repo/scripts/$script" --check; then
+        echo ""
+        echo "pre-commit: generated files are out of sync with the shared config repo."
+        echo "Run: python scripts/$script (in my-dev-team-config) and stage the result,"
+        echo "or fix the source there if a generated file was edited by hand."
+        exit 1
+    fi
+done

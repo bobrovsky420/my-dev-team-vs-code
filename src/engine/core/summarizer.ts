@@ -4,6 +4,7 @@ import { resolveModel, routeModel } from './models';
 import { resolveTokenCounts, UsageReporter } from './usage';
 import { parseWithRepair } from './repair';
 import { agents } from '../config/agents';
+import { withSteering } from '../config/steering';
 import { PartialSummary, Summary } from '../../protocol/types';
 
 export type { PartialSummary } from '../../protocol/types';
@@ -52,12 +53,13 @@ export class Summarizer {
    * the LocalEngine builds a fresh Summarizer per run with the request's choice.
    */
   constructor(modelPin?: string) {
-    this.modelName = routeModel(agents.summarizer.capabilities, modelPin).model;
+    const routed = routeModel(agents.summarizer.capabilities, modelPin);
+    this.modelName = routed.model;
     this.agent = new Agent({
       id: agents.summarizer.id,
       name: agents.summarizer.name,
       description: agents.summarizer.description,
-      instructions: agents.summarizer.instructions,
+      instructions: withSteering(agents.summarizer.instructions, routed),
       model: resolveModel(agents.summarizer.capabilities, modelPin),
     });
   }
@@ -74,7 +76,10 @@ export class Summarizer {
       const content = repair ? `${prompt}\n\n${repair}` : prompt;
       const output = await this.agent.stream(
         [{ role: 'user', content }],
-        { structuredOutput: { schema: SummaryGenSchema } }
+        {
+          structuredOutput: { schema: SummaryGenSchema },
+          modelSettings: agents.summarizer.modelSettings,
+        }
       );
       // Drain the partial-object stream, forwarding each snapshot; reading it
       // also drives the generation to completion, so this runs even with no

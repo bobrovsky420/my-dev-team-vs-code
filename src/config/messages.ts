@@ -13,6 +13,7 @@
  * them.
  */
 import type { ModelSelection, ProgressStatus } from '../protocol/types';
+import { providerDescriptor, type ProviderName } from './providers';
 
 /**
  * Wrap untrusted content (a command, a file path, a written-file snippet) in a
@@ -75,12 +76,10 @@ export const messages = {
    * applies. Travels to the UI as the protocol error's `hint`, like the Ollama
    * one.
    */
-  cloudKeyHint: (label: string, provider: 'openai' | 'anthropic' | 'groq') => {
-    const envVar = {
-      openai: 'OPENAI_API_KEY',
-      anthropic: 'ANTHROPIC_API_KEY',
-      groq: 'GROQ_API_KEY',
-    }[provider];
+  cloudKeyHint: (label: string, provider: ProviderName) => {
+    // The env var name comes from the provider registry, so a newly wired cloud
+    // provider needs no edit here (and the hint can never name a stale var).
+    const envVar = providerDescriptor(provider).envKey ?? 'provider API key';
     return (
       `\`${label}\` needs an API key. Set the ${envVar} environment variable ` +
       `(in the environment VS Code is launched from), or - for the local ` +
@@ -152,16 +151,32 @@ export const messages = {
      * The "which model ran" line under the triage block. In pinned mode it
      * names the chosen model; in Auto mode it lists the work agents' models so
      * the user sees what Auto picked (triage is always a fast local model and
-     * is omitted to keep the line short).
+     * is omitted to keep the line short). The **executor** is omitted here on
+     * purpose: its model is sized by the planner's post-exploration complexity,
+     * settled only once the plan is drafted, so reporting it in this upfront
+     * block (which renders before the plan) would force the streamed output to
+     * retract an already-shown model. It rides in the execution header instead
+     * (see `execution.header`), where its value is final and the render stays
+     * append-only.
      */
     block: (selection: ModelSelection): string => {
       const roleNames: Record<string, string> = {
         plan: 'Planner',
-        execute: 'Executor',
         answer: 'Answerer',
-        triage: 'Triage',
+        execute: 'Executor',
       };
-      const work = selection.models.filter((m) => m.step !== 'triage');
+      // Normally the executor is omitted here (its tier settles late, so showing
+      // it upfront would force a retraction) - it rides in the execution header.
+      // But the direct route has no plan/answer step, so the executor is the only
+      // working model and its tier is settled (a direct change is simple); fall
+      // back to it so the line is not empty.
+      const nonExecutor = selection.models.filter(
+        (m) => m.step !== 'triage' && m.step !== 'execute'
+      );
+      const work =
+        nonExecutor.length > 0
+          ? nonExecutor
+          : selection.models.filter((m) => m.step === 'execute');
       if (selection.mode === 'pinned') {
         const label = (work[0] ?? selection.models[0])?.label ?? '';
         return `**Model:** ${label} _(pinned)_\n\n`;
@@ -237,16 +252,26 @@ export const messages = {
       model: string;
       tokens: string;
       estimated: boolean;
+      verbosity: string;
+      triageMode: string;
+      debug: boolean;
       selectModelCommand: string;
+      selectTriageModeCommand: string;
       usageCommand: string;
       setKeyCommand: string;
     }): string =>
       `**My Dev Team**\n\n` +
       `---\n\n` +
       `Model: **${opts.model}**  \n` +
-      `Tokens this session: **${opts.estimated ? '~' : ''}${opts.tokens}**\n\n` +
+      `Routing: **${opts.triageMode}**  \n` +
+      `Output mode: **${opts.verbosity}**  \n` +
+      `Tokens this session: **${opts.estimated ? '~' : ''}${opts.tokens}**  \n` +
+      // Shown only while debug logging is on, so the line is a quiet reminder that
+      // the verbose "My Dev Team (Debug)" log is being written.
+      (opts.debug ? `Debug mode: **on**\n\n` : `\n`) +
       `---\n\n` +
       `[$(sparkle) Select model](command:${opts.selectModelCommand} "Choose the model for @devteam")\n\n` +
+      `[$(git-branch) Select routing mode](command:${opts.selectTriageModeCommand} "Choose how @devteam routes a request")\n\n` +
       `[$(symbol-number) Token usage report](command:${opts.usageCommand} "Open the token usage report")\n\n` +
       `[$(key) Set API key](command:${opts.setKeyCommand} "Store a cloud provider API key (local engine)")`,
     /** Placeholder atop the quick-pick menu the button opens. */
@@ -258,6 +283,8 @@ export const messages = {
       `$(symbol-number) Token usage  -  ${estimated ? '~' : ''}${total} this session`,
     /** The "change output verbosity" row, showing the current mode. */
     menuVerbosity: (label: string) => `$(list-selection) Output mode  -  current: ${label}`,
+    /** The "change routing mode" row, showing the current triage mode. */
+    menuTriageMode: (label: string) => `$(git-branch) Routing mode  -  current: ${label}`,
   },
 
   /**
@@ -273,8 +300,8 @@ export const messages = {
     /** Detail line under each mode in the picker. */
     detail: (mode: 'default' | 'verbose') =>
       mode === 'verbose'
-        ? 'Show everything: triage intent, reason, and complexity; full plan with step details.'
-        : 'Terser: triage intent only; plan summary and step titles, no details.',
+        ? 'Show everything: triage intent, reason, and complexity; full plan with step details; each tool call with its output.'
+        : 'Terser: triage intent only; plan summary and step titles; tool calls show just the tool name and what it acted on.',
     /** Suffix marking the mode that is currently selected, in the picker. */
     currentSuffix: ' (current)',
     /** Placeholder atop the verbosity quick pick. */
@@ -288,12 +315,42 @@ export const messages = {
   },
 
   /**
+   * Copy for the request-routing (triage mode) switcher: the status-bar menu row
+   * and the command-palette quick pick. The mode is the `myDevTeam.triage.mode`
+   * setting - `classifier` (a quick triage call, then the answerer or planner) or
+   * `combined` (one responder that triages and answers-or-plans in a single
+   * call) - read live by the engine, so a change takes effect on the next run.
+   */
+  triageMode: {
+    /** Human label for each mode, used in the picker and the status-bar menu. */
+    label: (mode: 'classifier' | 'combined') =>
+      mode === 'combined' ? 'Combined' : 'Classifier',
+    /** Detail line under each mode in the picker. */
+    detail: (mode: 'classifier' | 'combined') =>
+      mode === 'combined'
+        ? 'One agent decides the route and answers or plans in a single call on your work model - one fewer round-trip, no misroute dead-ends. Slash commands are unaffected.'
+        : 'A quick triage step routes the request, then the answerer or the planner runs - the default three-agent path.',
+    /** Suffix marking the mode that is currently selected, in the picker. */
+    currentSuffix: ' (current)',
+    /** Placeholder atop the routing-mode quick pick. */
+    pickerPlaceholder: 'Choose how @devteam routes a request',
+  },
+
+  /**
    * Copy for the tool approval gates. `run` is always gated; `write` and `edit`
    * are gated only when the user turns on `myDevTeam.approval.fileChanges` (off
    * by default, since the workspace is git-backed - see docs/DESIGN.md).
    */
   approval: {
     runCommandTitle: 'Run command',
+    /**
+     * Title of the run approval prompt for a command the agent flagged
+     * `dangerous` (destructive or irreversible). The warning icon and wording
+     * make the heightened risk obvious before the user approves, and its
+     * separate "Allow All" scope (`run:dangerous`) is never satisfied by an
+     * allowance granted for an ordinary command.
+     */
+    runCommandDangerousTitle: '⚠️ Run destructive command',
     /** Title of the write approval prompt (gated by myDevTeam.approval.fileChanges). */
     writeFileTitle: 'Write file',
     /** Title of the edit approval prompt (gated by myDevTeam.approval.fileChanges). */
@@ -304,10 +361,21 @@ export const messages = {
      * The preview shown for a run approval: the command, prefixed with a
      * shell-comment naming its cwd folder in a multi-root workspace (where the
      * command runs in the first folder). A single-folder workspace omits the
-     * line, so the preview is just the command as before.
+     * line, so the preview is just the command as before. When the agent flagged
+     * the command `dangerous`, a leading warning comment is added so the risk is
+     * visible inside the previewed command too, not only in the title.
      */
-    runCommandDetail: (command: string, cwdFolder?: string) =>
-      cwdFolder ? `# cwd: ${cwdFolder}\n$ ${command}` : `$ ${command}`,
+    runCommandDetail: (command: string, cwdFolder?: string, dangerous?: boolean) => {
+      const lines: string[] = [];
+      if (dangerous) {
+        lines.push('# WARNING: flagged as destructive or irreversible');
+      }
+      if (cwdFolder) {
+        lines.push(`# cwd: ${cwdFolder}`);
+      }
+      lines.push(`$ ${command}`);
+      return lines.join('\n');
+    },
     /** Title of an MCP tool-call approval prompt (every MCP call is gated). */
     mcpToolTitle: 'Call MCP tool',
     /**
@@ -318,22 +386,48 @@ export const messages = {
     /** The in-chat approval question: the action title plus its preview. */
     block: (title: string, detail: string) =>
       `\n\n**${title}?**\n\n${fence(detail, 3)}\n`,
-    /** Labels of the approval choices (the modal fallback still uses Approve). */
+    /** Labels of the approval choices (the modal fallback uses Approve / Allow All). */
     approve: 'Approve',
     decline: 'Decline',
     /**
-     * The Approve/Decline choices rendered as inline trusted-markdown command
-     * links, so they appear on one line instead of as VS Code's stacked
-     * buttons. `command` is the approval command id and `id` identifies the
-     * pending approval; both links invoke the same command with the approval id
-     * and the chosen boolean. Command-link arguments must be URI-encoded JSON.
+     * "Allow All" approves this action and every later one with the same scope
+     * (the same tool) for the rest of the chat conversation, so a routine run of
+     * many similar calls is not gated one by one. It is per scope (per tool) and
+     * per conversation: it never carries to a different tool, and a new chat (or
+     * /clear) starts asking again. Destructive `run` commands carry a distinct
+     * scope (`run:dangerous`), so allowing ordinary commands never auto-approves
+     * a destructive one - it asks again, with its own allowance. See ChatApprover
+     * in ui/chatParticipant.ts.
      */
-    links: (command: string, id: string) => {
-      const arg = (approved: boolean) =>
-        encodeURIComponent(JSON.stringify([id, approved]));
+    allowAll: 'Allow All',
+    /**
+     * Label of the optional "always allow commands like this" choice on a `run`
+     * approval (see AlwaysAllowOption). Unlike "Allow All" (in-memory, this
+     * conversation only), picking it persists `prefix` to
+     * `myDevTeam.run.allowedCommands`, so later matching commands skip the
+     * prompt for good. Offered only for an ordinary (non-destructive) command.
+     */
+    alwaysAllow: (prefix: string) => `Always allow \`${prefix}\``,
+    /**
+     * The Approve / Allow All / Decline choices (plus an optional persistent
+     * "always allow" choice) rendered as inline trusted-markdown command links,
+     * so they appear on one line instead of as VS Code's stacked buttons.
+     * `command` is the approval command id and `id` identifies the pending
+     * approval; each link invokes the same command with the approval id and the
+     * chosen verdict. `alwaysAllowLabel`, when given, inserts the persistent
+     * choice. Command-link arguments must be URI-encoded JSON.
+     */
+    links: (command: string, id: string, alwaysAllowLabel?: string) => {
+      const arg = (verdict: 'approve' | 'allow-all' | 'always-allow' | 'decline') =>
+        encodeURIComponent(JSON.stringify([id, verdict]));
+      const alwaysAllowLink = alwaysAllowLabel
+        ? `[**${alwaysAllowLabel}**](command:${command}?${arg('always-allow')}) | `
+        : '';
       return (
-        `[**${messages.approval.approve}**](command:${command}?${arg(true)}) | ` +
-        `[**${messages.approval.decline}**](command:${command}?${arg(false)})\n`
+        `[**${messages.approval.approve}**](command:${command}?${arg('approve')}) | ` +
+        `[**${messages.approval.allowAll}**](command:${command}?${arg('allow-all')}) | ` +
+        alwaysAllowLink +
+        `[**${messages.approval.decline}**](command:${command}?${arg('decline')})\n`
       );
     },
   },
@@ -423,6 +517,9 @@ export const messages = {
    * retrying the same failing call.
    */
   readFailed: {
+    notFound: (path: string) =>
+      `No such file or directory: ${path}. Use the search tool to find the ` +
+      'file you meant, or the write tool to create it.',
     pastEnd: (path: string, start: number, total: number) =>
       `${path} has only ${total} lines; startLine ${start} is past the end ` +
       'of the file.',
@@ -449,7 +546,12 @@ export const messages = {
     multipleMatches: (count: number, path: string) =>
       `oldText matches ${count} places in ${path}. Include more surrounding ` +
       'lines so it matches exactly one place.',
-    identical: 'oldText and newText are identical; nothing to change.',
+    identical:
+      'oldText and newText are identical after decoding, so this edit would ' +
+      'change nothing. If you intended a change, it may be in special characters ' +
+      '(a literal backslash, or straight vs. curly quotes) that were lost - ' +
+      're-read the file and retry, or use the write tool with the complete new ' +
+      'contents.',
   },
 
   /** Copy for the terminal mirroring the run tool's commands (ui/runTerminal.ts). */
@@ -501,6 +603,16 @@ export const messages = {
     changesLabel: 'Uncommitted git changes',
     /** Body when there are no uncommitted changes (or git is unavailable). */
     changesEmpty: '(no uncommitted git changes, or git is not available here)',
+    /**
+     * Notice prepended when the full diff overflowed the read buffer and only a
+     * `--stat` summary could be inlined. Distinguishes a genuinely large working
+     * tree from an empty one, so `#changes` never misreports a big diff as "no
+     * changes".
+     */
+    changesTooLarge:
+      '(the uncommitted diff is too large to include in full - only a file ' +
+      'summary is shown below; review the changes in source control, or stage ' +
+      'or narrow them to inline the detail)',
   },
 
   /**
@@ -629,6 +741,61 @@ export const messages = {
     header: '**Answer:**\n\n',
   },
 
+  /**
+   * The clarify route's copy: a heading, then each question with its options as a
+   * numbered list and an optional "answer in your own words" note. The questions
+   * arrive whole at the end of the run (not streamed), so this renders once; the
+   * leading blank line keeps it appended cleanly after the intent/model block.
+   * The suggested answers are also offered as clickable follow-ups (extension.ts),
+   * so clicking one or typing a reply both carry the work forward on the next turn.
+   */
+  clarify: {
+    header: (plural: boolean): string =>
+      plural
+        ? '\n\n**A couple of questions before I continue:**\n\n'
+        : '\n\n**A quick question before I continue:**\n\n',
+    question: (question: string): string => `${question}\n`,
+    option: (n: number, label: string): string => `${n}. ${label}\n`,
+    otherNote: '_Or reply in your own words._\n',
+    /**
+     * The in-run note the planner's `clarify` tool renders before it asks (see
+     * ChatClarifyPrompt): unlike the route above, the question is answered live
+     * in a pop-up and the run continues, so this is a short record in the
+     * transcript, with the chosen answer appended once given.
+     */
+    asking: (plural: boolean): string =>
+      plural
+        ? '\n\n**Pausing to ask a couple of questions before drafting the plan:**\n\n'
+        : '\n\n**Pausing to ask a question before drafting the plan:**\n\n',
+    answered: (question: string, answer: string): string =>
+      `- ${question} **${answer}**\n`,
+    /** Shown when the user dismissed the question without answering. */
+    skipped: (question: string): string =>
+      `- ${question} _(skipped - drafting from a reasonable assumption)_\n`,
+    /** Placeholder/label for the "answer in your own words" pop-up choice. */
+    otherChoice: 'Answer in my own words...',
+    /**
+     * The model-facing result the `clarify` tool returns into the planner loop
+     * (distinct from the transcript notes above): the user's answers, or a note
+     * to assume when they answered nothing. `clarify` is a client tool now, so
+     * the client composes this string the model reads.
+     */
+    toolResult: (answers: readonly { question: string; answer: string }[]): string =>
+      answers.length === 0
+        ? 'The user did not answer. Draft a plan using your best reasonable assumption.'
+        : `The user answered:\n${answers
+            .map((a) => `- "${a.question}": ${a.answer}`)
+            .join('\n')}`,
+  },
+
+  /** Model-facing strings the client's `skill` tool returns to the model. */
+  skill: {
+    /** Returned when a `skill` call names a skill the client does not have. */
+    notFound: (name: string): string =>
+      `No skill named "${name}" is available. Use one of the names in the ` +
+      `"Available skills" list, exactly as written.`,
+  },
+
   plan: {
     error: (detail: string) => `**Planner error:** ${detail}\n\n`,
     // A prefix rather than a template: the renderer streams the summary in
@@ -690,6 +857,89 @@ export const messages = {
   },
 
   /**
+   * Copy for the executor check-in (`myDevTeam.executor.checkpoint*`): the
+   * "still working" question shown after a long stretch of execution, and its
+   * inline Keep going / Stop command links. Mirrors `planApproval`.
+   */
+  checkpoint: {
+    /** The check-in question, naming how much work has happened so far. */
+    block: (stepsDone: number, secondsElapsed: number, lastAction?: string) => {
+      const did = lastAction ? `, last action: \`${lastAction}\`` : '';
+      return (
+        `\n\n**Still working** - ${stepsDone} steps, ${secondsElapsed}s so far${did}.\n` +
+        `Keep going, or stop here and summarize what I have?\n`
+      );
+    },
+    keepGoing: 'Keep going',
+    stop: 'Stop & summarize',
+    /**
+     * The two choices as inline trusted-markdown command links (one line, like
+     * the plan-review links). `command` is the check-in command id and `id`
+     * identifies the pending check-in; each link invokes the command with the id
+     * and the chosen action. Command-link arguments must be URI-encoded JSON.
+     */
+    links: (command: string, id: string) => {
+      const arg = (choice: 'continue' | 'stop') =>
+        encodeURIComponent(JSON.stringify([id, choice]));
+      return (
+        `[${messages.checkpoint.keepGoing}](command:${command}?${arg('continue')}) | ` +
+        `[${messages.checkpoint.stop}](command:${command}?${arg('stop')})\n`
+      );
+    },
+  },
+
+  /**
+   * Copy for the context-usage caution (`myDevTeam.executor.contextWarnThresholds`):
+   * a one-line blockquote shown when a run's context first crosses a threshold of
+   * the model's window, so the user can see it is filling up. `~` and the
+   * "estimated" note mark a count that is a length-based estimate rather than a
+   * provider-reported one.
+   */
+  context: {
+    warning: (
+      percent: number,
+      usedTokens: number,
+      contextWindow: number,
+      model: string,
+      estimated: boolean
+    ): string => {
+      const k = (n: number) => `${Math.round(n / 1000)}k`;
+      const approx = estimated ? '~' : '';
+      const note = estimated ? ', estimated' : '';
+      return (
+        `\n\n> ⚠️ Context ${approx}${percent}% full ` +
+        `(${approx}${k(usedTokens)} / ${k(contextWindow)} tokens${note}) for ${model}. ` +
+        `Reading much more may overflow its window - consider stopping at the next check-in.\n\n`
+      );
+    },
+    /**
+     * The inline "Compact now" action appended to a context warning below the
+     * auto-compact threshold: a trusted command link that runs /compact (the
+     * command opens the chat with `@devteam /compact`). The caller scopes the
+     * MarkdownString's `isTrusted` to just this command id.
+     */
+    compactAction: (command: string): string =>
+      `> [**Compact now**](command:${command}) to summarize the conversation so far and free up the window.\n\n`,
+    /**
+     * The notice shown when context crosses the auto-compact threshold and
+     * auto-compaction is on: the conversation will compact itself on the next
+     * message, so the user knows why the next turn opens with a summary.
+     */
+    autoCompacted: (model: string): string =>
+      `> 🧹 Context for ${model} is nearly full; the conversation will be compacted automatically on your next message.\n\n`,
+    /** Shown at the start of a turn while the automatic /compact pass runs. */
+    autoCompacting: 'Compacting the conversation to free up context...',
+    /**
+     * Progress shown during an intermediate pass of a multi-pass compaction (a
+     * conversation too large for the compacter model's window, summarized in a
+     * rolling refine). The final pass streams the summary itself, so only the
+     * earlier passes show this.
+     */
+    compactingPass: (pass: number, total: number): string =>
+      `Compacting the conversation (pass ${pass} of ${total})...`,
+  },
+
+  /**
    * Copy for the read-only plan preview document (ui/planPreview.ts): the
    * markdown a big or design-bearing plan renders into when it opens beside the
    * chat for approval. This is a standalone document the user reads, not a chat
@@ -719,8 +969,13 @@ export const messages = {
   execution: {
     error: (detail: string) => `**Executor error:** ${detail}\n\n`,
     // A prefix rather than a template: the transcript streams in behind it
-    // while the executor is still working.
-    header: '**Execution:**',
+    // while the executor is still working. The executor's model (when known)
+    // rides in the header rather than the upfront "Model:" block: it is sized by
+    // the planner's post-exploration complexity, settled only as execution
+    // starts, so rendering it here - below the now-final plan - keeps the
+    // streamed output append-only (the model block above it never changes).
+    header: (model?: string): string =>
+      '**Execution:**' + (model ? ` _(${model})_` : ''),
     /**
      * One transcript line per tool call (no bullet, the bolded display name
      * leads the line); the result is appended when it lands.
@@ -773,12 +1028,14 @@ export const messages = {
 
   thinking: {
     /**
-     * A condensed line of the model's reasoning, shown as transient chat
-     * progress (a spinner line) while it works - not appended to the reply, so
-     * it leaves no trace once real output streams in. The "Thinking:" lead
-     * tells the user the dimmed line is the model's reasoning, not its answer.
+     * The `_Thought for 12s_` line appended under a reply when a reasoning model
+     * spent time thinking (gated by `myDevTeam.thinking.showDuration`). Under a
+     * minute reads as `12s`; a minute or more as `1m 3s`.
      */
-    line: (text: string) => `Thinking: ${text}`,
+    duration: (seconds: number) =>
+      `\n\n_Thought for ${
+        seconds >= 60 ? `${Math.floor(seconds / 60)}m ${seconds % 60}s` : `${seconds}s`
+      }_`,
   },
 
   /** Copy for the engine switch (client/engineFactory.ts). */

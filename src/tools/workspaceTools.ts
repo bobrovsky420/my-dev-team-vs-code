@@ -2,11 +2,23 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 import { exec, ChildProcess, ExecOptions } from 'child_process';
 import { promisify } from 'util';
-import { Approver, ChangeReporter, RunMirror } from './types';
+import {
+  Approver,
+  ChangeReporter,
+  RunMirror,
+  RUN_SCOPE,
+  RUN_DANGEROUS_SCOPE,
+} from './types';
 import { settings } from '../config/settings';
 import { messages, TRUNCATED_SUFFIX } from '../config/messages';
 import { environment } from '../config/environment';
 import { searchContent } from './contentSearch';
+import {
+  isAllowedCommand,
+  isDeniedCommand,
+  suggestedAllowPrefix,
+  addAllowedCommand,
+} from './commandPolicy';
 
 // Re-exported so existing importers (client/references.ts) keep their import
 // from this module while the content-search engine lives in its own file.
@@ -40,6 +52,22 @@ function isVirtualWorkspace(): boolean {
   return (
     !!folders && folders.length > 0 && folders.every((f) => f.uri.scheme !== 'file')
   );
+}
+
+/**
+ * Whether a thrown fs error means "the file does not exist", however it
+ * surfaced: VS Code's `FileSystemError` (`code === 'FileNotFound'`) on a
+ * virtual filesystem, Node's `ENOENT` on the local one (`vscode.workspace.fs`
+ * passes the raw Node error through for `file:` paths), or the in-memory test
+ * fake (a plain `Error` whose message starts with `ENOENT`). Matching the code
+ * first and the message only as a fallback keeps it robust across all three.
+ */
+function isFileNotFound(err: unknown): boolean {
+  const e = err as { code?: unknown; message?: unknown } | null;
+  if (e?.code === 'ENOENT' || e?.code === 'FileNotFound') {
+    return true;
+  }
+  return typeof e?.message === 'string' && /ENOENT|no such file|file ?not ?found/i.test(e.message);
 }
 
 /** Whether a path exists (a stat that does not throw), used for disambiguation. */
@@ -261,7 +289,19 @@ export async function readFile(
   // the result, but the whole file is loaded before they apply, so without this
   // a read of a multi-GB or giant minified file would exhaust memory. The
   // attachment reader and the content scan guard the same way.
-  const stat = await vscode.workspace.fs.stat(resolved.uri);
+  let stat: vscode.FileStat;
+  try {
+    stat = await vscode.workspace.fs.stat(resolved.uri);
+  } catch (err) {
+    // A missing file is a recoverable condition the model self-corrects from
+    // (read elsewhere, or write to create it), not a hard failure: return a
+    // clean recovery message rather than letting Node's raw error - which spells
+    // out the absolute path, "ENOENT", and "stat" - surface as the tool result.
+    if (isFileNotFound(err)) {
+      return messages.readFailed.notFound(relPath);
+    }
+    throw err;
+  }
   if (stat.size > settings.read.maxFileSizeBytes) {
     return messages.readFailed.tooLarge(relPath, stat.size, settings.read.maxFileSizeBytes);
   }
@@ -379,12 +419,32 @@ function capRunOutput(text: string): string {
  * mirror receives the command's lifecycle and live output (Phase 1 shows it
  * in a "Dev Team" terminal); the buffered result returned to the model is
  * unaffected by it.
+ *
+ * A command that *ran but failed* - a non-zero exit or a timeout - **rejects**
+ * (with the reason and the command's output as the error message) rather than
+ * returning, so the failure crosses the tool seam as a failed call: the executor
+ * marks the transcript event failed and the run continues, instead of the model
+ * receiving a plain result string it might read as success (a killed-by-timeout
+ * run in particular). Outcomes that are not a command failure - a refusal
+ * (Restricted Mode / virtual workspace), a decline at the approval gate, a
+ * cancellation, and of course success - still return their string.
+ *
+ * `dangerous` is the model's own flag for a destructive or irreversible command
+ * (see the run tool's input schema). When set - or when the command matches the
+ * denylist (commandPolicy.ts), since the model's flag is decided from
+ * possibly-untrusted content - the approval prompt is escalated: it carries a
+ * warning title/preview and a distinct "Allow All" scope, so an allowance the
+ * user granted for ordinary commands never silently approves a destructive one,
+ * and the allowlist fast path never covers it. An ordinary command on the
+ * user's allowlist runs with no prompt; an ordinary command not on it can be
+ * added to the allowlist from the prompt's "always allow" choice.
  */
 export async function runCommand(
   command: string,
   approver: Approver,
   mirror?: RunMirror,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  dangerous?: boolean
 ): Promise<string> {
   // An untrusted folder (Restricted Mode) or a virtual workspace cannot run a
   // shell command; refuse before the approval prompt so the user is never
@@ -406,10 +466,40 @@ export async function runCommand(
   // In a multi-root workspace the command runs in the first folder; name it in
   // the prompt so the user knows which directory the command lands in.
   const cwdFolder = folders && folders.length > 1 ? folders[0].name : undefined;
-  const ok = await approver.confirm(
-    messages.approval.runCommandTitle,
-    messages.approval.runCommandDetail(command, cwdFolder)
-  );
+  // The denylist (a built-in floor plus the user's additions) forces a command
+  // to be treated as destructive regardless of the model's `dangerous` flag,
+  // which is decided from possibly-untrusted content. So a destructive command
+  // is escalated when the model flagged it *or* it is denylisted: a warning
+  // title/preview, and a distinct "Allow All" scope an ordinary allowance never
+  // covers - that asks again on its own. This closes the gap where an injected
+  // "ordinary-looking" command could ride an existing ordinary grant.
+  const effectiveDangerous = Boolean(dangerous) || isDeniedCommand(command);
+  let ok: boolean;
+  if (!effectiveDangerous && isAllowedCommand(command)) {
+    // The allowlist fast path: an ordinary command the user marked safe runs
+    // with no prompt (a denylisted command never reaches here).
+    ok = true;
+  } else {
+    // Offer the persistent "always allow commands like this" choice only for an
+    // ordinary command (never a destructive or denylisted one), and only when
+    // there is a sensible prefix to suggest.
+    const prefix = effectiveDangerous ? '' : suggestedAllowPrefix(command);
+    const alwaysAllow = prefix
+      ? {
+          label: messages.approval.alwaysAllow(prefix),
+          apply: () => addAllowedCommand(prefix),
+        }
+      : undefined;
+    ok = await approver.confirm(
+      effectiveDangerous
+        ? messages.approval.runCommandDangerousTitle
+        : messages.approval.runCommandTitle,
+      messages.approval.runCommandDetail(command, cwdFolder, effectiveDangerous),
+      effectiveDangerous ? RUN_DANGEROUS_SCOPE : RUN_SCOPE,
+      undefined,
+      alwaysAllow
+    );
+  }
   if (!ok) {
     // Declined commands never ran, so they never reach the mirror either.
     return messages.notApproved.run;
@@ -469,7 +559,16 @@ export async function runCommand(
     const output = capRunOutput(
       combineOutput(String(err?.stdout ?? ''), String(err?.stderr ?? ''))
     );
-    return output ? `${reason}\n${output}` : reason;
+    const message = output ? `${reason}\n${output}` : reason;
+    // A cancellation is the user stopping the run, not a failure to fix, so it
+    // stays an ordinary result (the run is being torn down anyway). A genuine
+    // command failure - a non-zero exit or a timeout - is thrown so it surfaces
+    // as a failed tool call rather than a result a model could mistake for
+    // success.
+    if (aborted) {
+      return message;
+    }
+    throw new Error(message);
   } finally {
     clearTimeout(killTimer);
     signal?.removeEventListener('abort', onAbort);
@@ -521,7 +620,8 @@ export async function writeFile(
   if (settings.approval.fileChanges && approver) {
     const ok = await approver.confirm(
       messages.approval.writeFileTitle,
-      messages.approval.fileChangeDetail(relPath)
+      messages.approval.fileChangeDetail(relPath),
+      'write'
     );
     if (!ok) {
       return messages.notApproved.write;
@@ -604,8 +704,12 @@ function locateEdit(
  * matches return a recovery instruction to the model instead of touching the
  * file, so a misremembered snippet can never corrupt it. Creating files stays
  * the write tool's job: a missing target is an error here, not an empty file
- * to fill. The replacement is read, located, and written back-to-back with no
- * pause in between, so no re-verification step is needed.
+ * to fill. On the ungated default path the read, locate, and write happen
+ * back-to-back with no pause, so no re-verification step is needed; when the
+ * optional approval gate (`myDevTeam.approval.fileChanges`) is on the prompt can
+ * sit open arbitrarily long, so the file is re-read and re-located after
+ * approval - an edit a concurrent on-disk change invalidated during the prompt
+ * is reported rather than clobbering it with the pre-prompt snapshot.
  */
 export async function editFile(
   relPath: string,
@@ -642,8 +746,8 @@ export async function editFile(
   } catch {
     return messages.editFailed.missingFile(relPath);
   }
-  const text = Buffer.from(bytes).toString('utf8');
-  const located = locateEdit(text, relPath, oldText, newText);
+  let text = Buffer.from(bytes).toString('utf8');
+  let located = locateEdit(text, relPath, oldText, newText);
   if ('failure' in located) {
     return located.failure;
   }
@@ -654,7 +758,8 @@ export async function editFile(
   if (settings.approval.fileChanges && approver) {
     const ok = await approver.confirm(
       messages.approval.editFileTitle,
-      messages.approval.fileChangeDetail(relPath)
+      messages.approval.fileChangeDetail(relPath),
+      'edit'
     );
     if (!ok) {
       return messages.notApproved.edit;
@@ -662,6 +767,22 @@ export async function editFile(
     if (signal?.aborted) {
       return messages.cancelled.edit;
     }
+    // The prompt can sit open arbitrarily long; the file may have changed on
+    // disk meanwhile. Re-read and re-locate against the current contents so the
+    // write reflects them rather than clobbering a concurrent edit with the
+    // pre-prompt snapshot - and if the edit no longer applies (the file vanished,
+    // or oldText is now absent or ambiguous) report that instead of writing
+    // stale text. The ungated path above has no pause, so it keeps its one read.
+    try {
+      text = Buffer.from(await vscode.workspace.fs.readFile(resolved.uri)).toString('utf8');
+    } catch {
+      return messages.editFailed.missingFile(relPath);
+    }
+    const relocated = locateEdit(text, relPath, oldText, newText);
+    if ('failure' in relocated) {
+      return relocated.failure;
+    }
+    located = relocated;
   }
   // Re-check containment immediately before writing the edit back, so a symlink
   // swapped in after the resolve cannot redirect the write outside the

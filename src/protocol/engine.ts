@@ -5,27 +5,27 @@
  * contract over HTTP - and a VS Code setting switches between them, so
  * nothing above this interface may depend on which one is running.
  */
-import { Complexity, ModelChoice, Plan, PlanDecision, Reply, RunRequest } from './types';
+import { ModelChoice, Reply, RunRequest } from './types';
 import { RunEvent, RunStep } from './events';
-import { ToolHost } from './toolContract';
+import { ClientHost } from './capabilities';
 
 /**
- * What the client hands the engine for one run: where to deliver events and
- * who executes tools. `onEvent` must not throw into the engine - a rendering
- * problem must never fail the run it is only observing.
+ * What the client hands the engine for one run: where to deliver events
+ * (`onEvent`), plus the one inversion seam the engine reaches it through (the
+ * `ClientHost` it extends - `tools`, `capabilities`, and `invoke`). Every
+ * engine->client request - running a tool, approving a plan, an executor
+ * check-in, a clarifying question, loading a skill body - crosses that single
+ * `invoke` seam, named by capability, so a new capability never needs a new
+ * method here. The UI lives entirely on the client: the engine only ever asks,
+ * and a capability the client does not list in `capabilities` simply degrades
+ * (the engine never gates, never asks, reports a skill unavailable, ...), so
+ * each one is purely additive.
+ *
+ * `onEvent` must not throw into the engine - a rendering problem must never fail
+ * the run it is only observing.
  */
-export interface RunClient {
+export interface RunClient extends ClientHost {
   onEvent(event: RunEvent): void;
-  toolHost: ToolHost;
-  /**
-   * The plan-approval seam: the engine calls this when a drafted plan needs the
-   * user's verdict before executing (see the `myDevTeam.planApproval` setting),
-   * and the client returns approve / cancel / revise. Like the ToolHost, the UI
-   * lives entirely on the client - the engine only ever asks. Optional: a client
-   * that does not implement it (or an engine that never gates) simply proceeds
-   * to execution without a checkpoint, so the gate is purely additive.
-   */
-  reviewPlan?(plan: Plan, complexity: Complexity): Promise<PlanDecision>;
 }
 
 /** A started run. `result` settles exactly once; `cancel` is idempotent. */

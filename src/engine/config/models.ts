@@ -16,6 +16,16 @@
  * below discovers it at build time. Only register models that are actually
  * available (e.g. pulled in Ollama) — selection assumes every registered
  * model can run.
+ *
+ * Users can register extra models at runtime without republishing the
+ * extension, through the injected `myDevTeam.customModels` config (see
+ * `runtimeConfig().customModels`): the same structured fields as the
+ * frontmatter, validated here against the same schema. Those are *add-only* -
+ * they can only name an already-wired provider (a custom model needs no new
+ * code because the provider's wiring already takes any model-name string), and
+ * an id that collides with a built-in (or an earlier custom entry) is dropped.
+ * Hence `modelRegistry()` is a function, not a constant: it re-merges the
+ * build-time models with whatever the user has registered now.
  */
 import { z } from 'zod';
 import { parseFrontmatter } from './frontmatter';
@@ -25,18 +35,29 @@ import {
   providerLabels as registryProviderLabels,
   type ProviderName,
 } from '../../config/providers';
+import { runtimeConfig, type CustomModelInput } from '../../config/runtimeConfig';
 import modelFiles from 'glob:./models/*.md';
 
 export type { ProviderName } from '../../config/providers';
 
-/** The capability vocabulary models are scored on and agents weight. */
+/**
+ * The capability vocabulary models are scored on and agents weight: the
+ * unified 8-name set shared with the my-dev-team pipeline through the
+ * my-dev-team-config registry (its models.yaml speaks exactly these names).
+ */
 export const capabilityNames = [
   'reasoning',
-  'coding',
+  'code-generation',
+  'code-analysis',
   'classification',
   'planning',
-  'speed',
+  'fast-utility',
   'structured-output',
+  // How well the model handles a very large input - in practice, how big its
+  // context window is. Scored roughly by window size, so an agent that must read
+  // a lot at once (the compacter, which summarizes the whole conversation) can
+  // weight this high and Auto routes it to a big-window model.
+  'long-context',
 ] as const;
 
 export type Capability = (typeof capabilityNames)[number];
@@ -47,11 +68,47 @@ export type Capability = (typeof capabilityNames)[number];
  */
 export type CapabilityScores = Partial<Record<Capability, number>>;
 
-export const CapabilityScoresSchema = z
-  .partialRecord(z.enum(capabilityNames), z.number().min(0).max(1))
-  .refine((scores) => Object.keys(scores).length > 0, {
-    message: 'At least one capability must be given.',
-  });
+/**
+ * The pre-unification dialect names, still accepted in hand-written config
+ * (a user's `myDevTeam.customModels` entries predate the rename) and expanded
+ * to their unified equivalents on load. `coding` was the fold of the two code
+ * capabilities, so it expands to both; an explicit unified name in the same
+ * map wins over the alias expansion.
+ */
+const CAPABILITY_ALIASES: Record<string, readonly Capability[]> = {
+  coding: ['code-generation', 'code-analysis'],
+  speed: ['fast-utility'],
+};
+
+function normalizeCapabilityNames(value: unknown): unknown {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return value;
+  }
+  const entries = Object.entries(value);
+  const out: Record<string, unknown> = {};
+  for (const [name, score] of entries) {
+    if (!(name in CAPABILITY_ALIASES)) {
+      out[name] = score;
+    }
+  }
+  for (const [name, score] of entries) {
+    for (const target of CAPABILITY_ALIASES[name] ?? []) {
+      if (!(target in out)) {
+        out[target] = score;
+      }
+    }
+  }
+  return out;
+}
+
+export const CapabilityScoresSchema = z.preprocess(
+  normalizeCapabilityNames,
+  z
+    .partialRecord(z.enum(capabilityNames), z.number().min(0).max(1))
+    .refine((scores) => Object.keys(scores).length > 0, {
+      message: 'At least one capability must be given.',
+    })
+);
 
 const ModelFrontmatterSchema = z.object({
   /** Stable registry id, also the memoisation key for wired instances. */
@@ -93,6 +150,15 @@ const ModelFrontmatterSchema = z.object({
   triageOnly: z.boolean().default(false),
   /** How good this model is at each capability, 0–1. */
   capabilities: CapabilityScoresSchema,
+  /**
+   * The model's context window in tokens, used to warn when a run's context is
+   * filling up (see `contextWindowFor` in core/models.ts and the executor's
+   * context-usage check-in). For a local model this is the theoretical maximum;
+   * the effective window is whatever the server was launched with, so a user can
+   * correct any model's value with `myDevTeam.modelContextWindows`. Optional: a
+   * model that omits it (and has no override) simply gets no context warnings.
+   */
+  contextWindow: z.number().int().positive().optional(),
 });
 
 export interface ModelInfo extends z.infer<typeof ModelFrontmatterSchema> {
@@ -122,8 +188,92 @@ export function loadModels(files: readonly string[]): ModelInfo[] {
   return models;
 }
 
-/** All models the router may select, in filename order (ties go first). */
-export const modelRegistry: readonly ModelInfo[] = loadModels(modelFiles);
+/** The build-time models, discovered from the `.md` files (filename order). */
+const builtinModels: readonly ModelInfo[] = loadModels(modelFiles);
+
+/**
+ * A custom model's schema: the same structured fields as a built-in, but with
+ * two relaxations for hand-written config. `capabilities` is optional (a user
+ * pinning a freshly released model should not have to invent scores - a pin
+ * wins outright regardless; the default below only matters if Auto ever
+ * considers it), and `description` is an optional inline field since there is
+ * no markdown body to carry it.
+ */
+const CustomModelSchema = ModelFrontmatterSchema.extend({
+  capabilities: CapabilityScoresSchema.optional(),
+  description: z.string().optional(),
+});
+
+/**
+ * The capability profile a custom model gets when it declares none: a neutral
+ * 0.5 across the vocabulary, so Auto neither favours nor avoids it. An explicit
+ * pin ignores scores, so this only affects Auto/provider-pin routing.
+ */
+const DEFAULT_CUSTOM_CAPABILITIES: CapabilityScores = Object.fromEntries(
+  capabilityNames.map((name) => [name, 0.5])
+);
+
+/**
+ * Validate the user's custom-model entries and turn the valid ones into
+ * registry entries, add-only: an entry that fails the schema, names a duplicate
+ * id (`taken` seeds the built-in ids, then each accepted custom id is added), is
+ * dropped with a warning rather than throwing - one bad entry must not break
+ * every run. Returns the accepted entries in input order.
+ */
+function loadCustomModels(
+  raw: readonly CustomModelInput[],
+  taken: ReadonlySet<string>
+): ModelInfo[] {
+  const out: ModelInfo[] = [];
+  const seen = new Set(taken);
+  for (const entry of raw) {
+    const parsed = CustomModelSchema.safeParse(entry);
+    if (!parsed.success) {
+      console.warn(
+        `Ignoring an invalid custom model: ${parsed.error.issues[0]?.message ?? 'invalid entry'}.`
+      );
+      continue;
+    }
+    const data = parsed.data;
+    if (seen.has(data.id)) {
+      console.warn(
+        `Ignoring custom model "${data.id}": that id is already registered (custom models can only add new models, not redefine one).`
+      );
+      continue;
+    }
+    seen.add(data.id);
+    out.push({
+      ...data,
+      capabilities: data.capabilities ?? DEFAULT_CUSTOM_CAPABILITIES,
+      description: data.description?.trim() ?? '',
+    });
+  }
+  return out;
+}
+
+/** The accepted custom models, memoised by the raw config's content signature
+ * so the validation (and its warnings) runs only when the setting changes. */
+let customCache: { signature: string; models: ModelInfo[] } | undefined;
+function customModels(): readonly ModelInfo[] {
+  const raw = runtimeConfig().customModels ?? [];
+  const signature = JSON.stringify(raw);
+  if (!customCache || customCache.signature !== signature) {
+    const taken = new Set(builtinModels.map((m) => m.id));
+    customCache = { signature, models: loadCustomModels(raw, taken) };
+  }
+  return customCache.models;
+}
+
+/**
+ * All models the router may select: the build-time models plus any the user
+ * registered via `myDevTeam.customModels` (add-only - see the file header). A
+ * function, not a constant, because the custom set is injected at runtime and
+ * can change with the user's settings.
+ */
+export function modelRegistry(): readonly ModelInfo[] {
+  const custom = customModels();
+  return custom.length === 0 ? builtinModels : [...builtinModels, ...custom];
+}
 
 /**
  * The sentinel a client sends (or omits) to let the capability router pick per
@@ -149,7 +299,7 @@ export const providerLabels: Record<ProviderName, string> = registryProviderLabe
 
 /** The registered model with this id, or undefined for "auto"/unknown ids. */
 export function modelById(id: string | undefined): ModelInfo | undefined {
-  return id === undefined ? undefined : modelRegistry.find((m) => m.id === id);
+  return id === undefined ? undefined : modelRegistry().find((m) => m.id === id);
 }
 
 /**
@@ -162,7 +312,7 @@ export function providerPinOf(pin: string | undefined): ProviderName | undefined
     return undefined;
   }
   const name = pin.slice(PROVIDER_PIN_PREFIX.length) as ProviderName;
-  return modelRegistry.some((m) => m.provider === name) ? name : undefined;
+  return modelRegistry().some((m) => m.provider === name) ? name : undefined;
 }
 
 /** Tier as a 0-2 ordinal, so "nearest available tier" is an integer distance. */
@@ -235,7 +385,7 @@ export function scoreModel(info: ModelInfo, requirements: CapabilityScores): num
 export function selectModel(
   requirements: CapabilityScores,
   pin?: string,
-  candidates: readonly ModelInfo[] = modelRegistry,
+  candidates?: readonly ModelInfo[],
   complexity?: Complexity,
   isEnabled: (info: ModelInfo) => boolean = () => true
 ): ModelInfo {
@@ -245,8 +395,8 @@ export function selectModel(
   }
   const provider = providerPinOf(pin);
   const base = provider
-    ? modelRegistry.filter((m) => m.provider === provider && isEnabled(m))
-    : candidates.filter(isEnabled);
+    ? modelRegistry().filter((m) => m.provider === provider && isEnabled(m))
+    : (candidates ?? modelRegistry()).filter(isEnabled);
   const pool = complexity ? tierPool(base, complexity) : base;
   let best: ModelInfo | undefined;
   let bestScore = -Infinity;

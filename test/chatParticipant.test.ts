@@ -3,9 +3,13 @@ import {
   APPROVAL_COMMAND_ID,
   ChatApprover,
   ChatPlanReviewer,
+  ChatContinuePrompt,
   PLAN_REVIEW_COMMAND_ID,
+  CONTINUE_REVIEW_COMMAND_ID,
+  COMPACT_NOW_COMMAND_ID,
   createHandler,
   renderReply,
+  sharedLinePrefixLength,
   PARTICIPANT_ID,
 } from '../src/ui/chatParticipant';
 import { PartialSummary, Reply, ReplyProgress } from '../src/protocol/types';
@@ -14,6 +18,7 @@ import {
   Engine,
   RunCancelledError,
   RunFailedError,
+  RunClient,
 } from '../src/protocol/engine';
 import { ToolHost } from '../src/protocol/toolContract';
 import { EvalLog, EVAL_LOG_FILENAME } from '../src/client/evalLog';
@@ -28,6 +33,8 @@ import {
   PartialExecution,
 } from '../src/engine/core/executor';
 import { settings } from '../src/config/settings';
+import { messages } from '../src/config/messages';
+import { cloudProviderDescriptors } from '../src/config/providers';
 import {
   __reset,
   __setConfig,
@@ -47,10 +54,11 @@ beforeEach(() => {
   __reset();
   // Keep model routing independent of the developer's machine: a cloud key in
   // the environment would make Auto prefer that provider and change which model
-  // the failure hints name (these tests assert the local Ollama hint).
-  delete process.env.OPENAI_API_KEY;
-  delete process.env.ANTHROPIC_API_KEY;
-  delete process.env.GROQ_API_KEY;
+  // the failure hints name (these tests assert the local Ollama hint). Derived
+  // from the registry, so a newly added cloud provider cannot leak back in.
+  for (const provider of cloudProviderDescriptors) {
+    delete process.env[provider.envKey!];
+  }
 });
 
 function fakeStream() {
@@ -196,10 +204,10 @@ describe('ChatApprover', () => {
     return { approver, stream, session, click, context };
   }
 
-  it('renders the question with inline Approve/Decline links into the chat', async () => {
+  it('renders the question with inline Approve/Allow All/Decline links into the chat', async () => {
     const { approver, stream, click } = wiredApprover();
 
-    const pending = approver.confirm('Run command', 'preview body');
+    const pending = approver.confirm('Run command', 'preview body', 'run');
     expect(stream.markdown).toHaveBeenCalledOnce();
     const md = stream.markdown.mock.calls[0][0] as {
       value: string;
@@ -208,13 +216,14 @@ describe('ChatApprover', () => {
     expect(md.value).toContain('**Run command?**');
     expect(md.value).toContain('preview body');
     expect(md.value).toContain('[**Approve**](command:');
+    expect(md.value).toContain('[**Allow All**](command:');
     expect(md.value).toContain('[**Decline**](command:');
     // Trust is scoped to just the approval command, so no other command: link
     // in the block could fire.
     expect(md.isTrusted).toEqual({ enabledCommands: [APPROVAL_COMMAND_ID] });
 
     const links = approvalLinks(stream);
-    expect(links).toHaveLength(2);
+    expect(links).toHaveLength(3);
     expect(links[0].command).toBe(APPROVAL_COMMAND_ID);
 
     click(0); // Approve
@@ -224,19 +233,19 @@ describe('ChatApprover', () => {
   it('resolves false when the user clicks Decline', async () => {
     const { approver, click } = wiredApprover();
 
-    const pending = approver.confirm('Run command', '$ ls');
-    click(1); // Decline
+    const pending = approver.confirm('Run command', '$ ls', 'run');
+    click(2); // Decline
     await expect(pending).resolves.toBe(false);
   });
 
   it('settles concurrent approvals independently by id', async () => {
     const { approver, stream, click } = wiredApprover();
 
-    const first = approver.confirm('Run command', 'one');
-    const second = approver.confirm('Run command', 'two');
-    expect(approvalLinks(stream)).toHaveLength(4);
+    const first = approver.confirm('Run command', 'one', 'run');
+    const second = approver.confirm('Run command', 'two', 'run');
+    expect(approvalLinks(stream)).toHaveLength(6);
 
-    click(3); // decline the second
+    click(5); // decline the second
     click(0); // approve the first
     await expect(first).resolves.toBe(true);
     await expect(second).resolves.toBe(false);
@@ -245,16 +254,16 @@ describe('ChatApprover', () => {
   it('ignores a stale button click after the approval settled', async () => {
     const { approver, click } = wiredApprover();
 
-    const pending = approver.confirm('Run command', '$ ls');
+    const pending = approver.confirm('Run command', '$ ls', 'run');
     click(0);
     await expect(pending).resolves.toBe(true);
-    expect(() => click(1)).not.toThrow(); // late Decline click is a no-op
+    expect(() => click(2)).not.toThrow(); // late Decline click is a no-op
   });
 
   it('declines whatever is still pending when its session is disposed', async () => {
     const { approver, session } = wiredApprover();
 
-    const pending = approver.confirm('Run command', 'preview');
+    const pending = approver.confirm('Run command', 'preview', 'run');
     session.dispose(); // request ended or was cancelled
     await expect(pending).resolves.toBe(false);
   });
@@ -262,10 +271,10 @@ describe('ChatApprover', () => {
   it('falls back to the modal when no session is open', async () => {
     const approver = new ChatApprover();
     __state.warningResponse = 'Approve';
-    await expect(approver.confirm('Run command', '$ ls')).resolves.toBe(true);
+    await expect(approver.confirm('Run command', '$ ls', 'run')).resolves.toBe(true);
 
     __state.warningResponse = undefined; // user dismissed the modal
-    await expect(approver.confirm('Run command', '$ ls')).resolves.toBe(false);
+    await expect(approver.confirm('Run command', '$ ls', 'run')).resolves.toBe(false);
   });
 
   it('asks via the modal, not the stream, after the session is disposed', async () => {
@@ -273,7 +282,7 @@ describe('ChatApprover', () => {
     session.dispose();
     __state.warningResponse = 'Approve';
 
-    await expect(approver.confirm('Run command', '$ ls')).resolves.toBe(true);
+    await expect(approver.confirm('Run command', '$ ls', 'run')).resolves.toBe(true);
     expect(stream.markdown).not.toHaveBeenCalled();
     expect(approvalLinks(stream)).toHaveLength(0);
   });
@@ -289,7 +298,7 @@ describe('ChatApprover', () => {
     approver.openSession(closed as any);
     __state.warningResponse = 'Approve';
 
-    await expect(approver.confirm('Run command', '$ ls')).resolves.toBe(true);
+    await expect(approver.confirm('Run command', '$ ls', 'run')).resolves.toBe(true);
   });
 
   it('keeps a concurrent request\'s approval pending when another request ends', async () => {
@@ -301,11 +310,11 @@ describe('ChatApprover', () => {
 
     const streamA = fakeStream();
     const sessionA = approver.openSession(streamA as any);
-    const pendingA = approver.confirm('Run command', 'a'); // rendered into A
+    const pendingA = approver.confirm('Run command', 'a', 'run'); // rendered into A
 
     const streamB = fakeStream();
     const sessionB = approver.openSession(streamB as any);
-    const pendingB = approver.confirm('Run command', 'b'); // rendered into B
+    const pendingB = approver.confirm('Run command', 'b', 'run'); // rendered into B
 
     sessionA.dispose(); // request A finishes (or is cancelled)
     await expect(pendingA).resolves.toBe(false);
@@ -319,7 +328,7 @@ describe('ChatApprover', () => {
 
   it('disposing a session twice is a harmless no-op', async () => {
     const { approver, session } = wiredApprover();
-    const pending = approver.confirm('Run command', 'preview');
+    const pending = approver.confirm('Run command', 'preview', 'run');
     session.dispose();
     expect(() => session.dispose()).not.toThrow();
     await expect(pending).resolves.toBe(false);
@@ -337,7 +346,7 @@ describe('ChatApprover', () => {
     const streamB = fakeStream();
     approver.openSession(streamB as any, 'runB'); // most recent
 
-    const pending = approver.confirm('Run command', 'a', 'runA');
+    const pending = approver.confirm('Run command', 'a', 'run', 'runA');
     expect(streamB.markdown).not.toHaveBeenCalled();
     const link = approvalLinks(streamA)[0];
     expect(link).toBeDefined();
@@ -354,8 +363,156 @@ describe('ChatApprover', () => {
     approver.openSession(streamOther as any, 'otherRun');
     __state.warningResponse = 'Approve';
 
-    await expect(approver.confirm('Run command', 'x', 'goneRun')).resolves.toBe(true);
+    await expect(approver.confirm('Run command', 'x', 'run', 'goneRun')).resolves.toBe(true);
     expect(streamOther.markdown).not.toHaveBeenCalled();
+  });
+
+  it('Allow All approves and skips the prompt for the same scope afterwards', async () => {
+    const { approver, stream, click } = wiredApprover();
+
+    const first = approver.confirm('Run command', '$ ls', 'run');
+    click(1); // Allow All
+    await expect(first).resolves.toBe(true);
+
+    // A later run in the same conversation is approved without rendering a
+    // second prompt.
+    stream.markdown.mockClear();
+    await expect(approver.confirm('Run command', '$ pwd', 'run')).resolves.toBe(true);
+    expect(stream.markdown).not.toHaveBeenCalled();
+  });
+
+  it('Allow All is per scope: allowing write still asks for edit', async () => {
+    const { approver, stream, click } = wiredApprover();
+
+    const write = approver.confirm('Write file', 'a.ts', 'write');
+    click(1); // Allow All for write
+    await expect(write).resolves.toBe(true);
+
+    // edit is a different scope, so it still renders its own prompt.
+    stream.markdown.mockClear();
+    const edit = approver.confirm('Edit file', 'a.ts', 'edit');
+    expect(stream.markdown).toHaveBeenCalledOnce();
+    click(1); // (the edit prompt's Allow All)
+    await expect(edit).resolves.toBe(true);
+  });
+
+  it('Allow All for ordinary run does not cover a dangerous run', async () => {
+    const { approver, stream, click } = wiredApprover();
+
+    const ordinary = approver.confirm('Run command', '$ ls', 'run');
+    click(1); // Allow All for ordinary run
+    await expect(ordinary).resolves.toBe(true);
+
+    // A destructive command carries its own scope, so it still asks - the
+    // ordinary allowance never silently approves it.
+    stream.markdown.mockClear();
+    const danger = approver.confirm(
+      '⚠️ Run destructive command',
+      '$ rm -rf build',
+      'run:dangerous'
+    );
+    expect(stream.markdown).toHaveBeenCalledOnce();
+    click(1); // its own Allow All
+    await expect(danger).resolves.toBe(true);
+
+    // Once allowed, later destructive commands in the conversation skip the prompt.
+    stream.markdown.mockClear();
+    await expect(
+      approver.confirm('⚠️ Run destructive command', '$ rm -rf dist', 'run:dangerous')
+    ).resolves.toBe(true);
+    expect(stream.markdown).not.toHaveBeenCalled();
+  });
+
+  it('Allow All for a dangerous run also allows ordinary runs', async () => {
+    const { approver, stream, click } = wiredApprover();
+
+    const danger = approver.confirm(
+      '⚠️ Run destructive command',
+      '$ rm -rf build',
+      'run:dangerous'
+    );
+    click(1); // Allow All for the dangerous command
+    await expect(danger).resolves.toBe(true);
+
+    // An ordinary command is now approved without a prompt: the dangerous
+    // allowance subsumes the ordinary scope.
+    stream.markdown.mockClear();
+    await expect(approver.confirm('Run command', '$ ls', 'run')).resolves.toBe(true);
+    expect(stream.markdown).not.toHaveBeenCalled();
+
+    // And later dangerous commands stay covered too.
+    await expect(
+      approver.confirm('⚠️ Run destructive command', '$ rm -rf dist', 'run:dangerous')
+    ).resolves.toBe(true);
+    expect(stream.markdown).not.toHaveBeenCalled();
+  });
+
+  it('Allow All is per conversation: another conversation asks again', async () => {
+    const approver = new ChatApprover();
+    const context = { subscriptions: [] as unknown[] };
+    approver.register(context as any);
+
+    const streamA = fakeStream();
+    approver.openSession(streamA as any, 'runA', 'conv-1');
+    const allowed = approver.confirm('Run command', '$ ls', 'run', 'runA');
+    const linkA = approvalLinks(streamA)[1]; // Allow All
+    __state.registeredCommands.get(linkA.command)!(...linkA.arguments);
+    await expect(allowed).resolves.toBe(true);
+
+    // A different conversation does not inherit the allowance.
+    const streamB = fakeStream();
+    approver.openSession(streamB as any, 'runB', 'conv-2');
+    approver.confirm('Run command', '$ pwd', 'run', 'runB');
+    expect(approvalLinks(streamB)).toHaveLength(3); // prompted, not auto-approved
+  });
+
+  it('remembers Allow All chosen from the modal fallback', async () => {
+    const approver = new ChatApprover();
+    __state.warningResponse = 'Allow All';
+    await expect(approver.confirm('Run command', '$ ls', 'run')).resolves.toBe(true);
+
+    // The window-scoped allowance now approves the next call without a modal.
+    __state.warningResponse = undefined; // a modal now would resolve false
+    await expect(approver.confirm('Run command', '$ pwd', 'run')).resolves.toBe(true);
+  });
+
+  it('offers an "always allow" link that approves and applies the rule', async () => {
+    const { approver, stream, click } = wiredApprover();
+    const apply = vi.fn(async () => {});
+
+    const pending = approver.confirm('Run command', '$ git status', 'run', undefined, {
+      label: 'Always allow `git status`',
+      apply,
+    });
+    const links = approvalLinks(stream);
+    // Approve, Allow All, Always allow, Decline.
+    expect(links).toHaveLength(4);
+    expect(stream.markdown.mock.calls[0][0].value).toContain(
+      '[**Always allow `git status`**](command:'
+    );
+
+    click(2); // Always allow
+    await expect(pending).resolves.toBe(true);
+    expect(apply).toHaveBeenCalledOnce();
+  });
+
+  it('does not render an "always allow" link when no option is given', async () => {
+    const { approver, stream } = wiredApprover();
+    approver.confirm('Run command', '$ ls', 'run');
+    expect(stream.markdown.mock.calls[0][0].value).not.toContain('Always allow');
+  });
+
+  it('applies the rule when "always allow" is chosen from the modal fallback', async () => {
+    const approver = new ChatApprover();
+    const apply = vi.fn(async () => {});
+    __state.warningResponse = 'Always allow `git status`';
+    await expect(
+      approver.confirm('Run command', '$ git status', 'run', undefined, {
+        label: 'Always allow `git status`',
+        apply,
+      })
+    ).resolves.toBe(true);
+    expect(apply).toHaveBeenCalledOnce();
   });
 });
 
@@ -435,6 +592,65 @@ describe('ChatPlanReviewer', () => {
   });
 });
 
+describe('ChatContinuePrompt', () => {
+  /** Wire a prompt the way activate() does and return a click(n, choice) helper. */
+  function wiredPrompt() {
+    const prompt = new ChatContinuePrompt();
+    const context = { subscriptions: [] as unknown[] };
+    prompt.register(context as any);
+    const stream = fakeStream();
+    const session = prompt.openSession(stream as any);
+    const click = (n: number) => {
+      const link = approvalLinks(stream)[n];
+      return __state.registeredCommands.get(link.command)!(...link.arguments);
+    };
+    return { prompt, stream, session, click };
+  }
+
+  const info = { stepsDone: 12, secondsElapsed: 90, lastAction: 'read' };
+
+  it('renders the check-in with inline Keep going / Stop links', async () => {
+    const { prompt, stream } = wiredPrompt();
+    void prompt.confirm(info);
+    const md = stream.markdown.mock.calls[0][0] as { value: string; isTrusted: unknown };
+    expect(md.value).toContain('Still working');
+    expect(md.value).toContain('12 steps');
+    expect(md.value).toContain('`read`');
+    expect(md.isTrusted).toEqual({ enabledCommands: [CONTINUE_REVIEW_COMMAND_ID] });
+    const links = approvalLinks(stream);
+    expect(links).toHaveLength(2);
+    expect(links[0].command).toBe(CONTINUE_REVIEW_COMMAND_ID);
+  });
+
+  it('resolves continue and stop from their links', async () => {
+    const a = wiredPrompt();
+    const cont = a.prompt.confirm(info);
+    a.click(0);
+    await expect(cont).resolves.toEqual({ kind: 'continue' });
+
+    const b = wiredPrompt();
+    const stop = b.prompt.confirm(info);
+    b.click(1);
+    await expect(stop).resolves.toEqual({ kind: 'stop' });
+  });
+
+  it('resolves a pending check-in as continue when its session is disposed', async () => {
+    // A closed session must not truncate a run that was doing fine - the safe
+    // default is to keep going (real cancellation has its own path).
+    const { prompt, session } = wiredPrompt();
+    const pending = prompt.confirm(info);
+    session.dispose();
+    await expect(pending).resolves.toEqual({ kind: 'continue' });
+  });
+
+  it('falls back to the modal (dismiss keeps going) when no session is open', async () => {
+    // The vscode mock's showInformationMessage returns undefined (dismissed),
+    // which the prompt treats as "continue".
+    const prompt = new ChatContinuePrompt();
+    await expect(prompt.confirm(info)).resolves.toEqual({ kind: 'continue' });
+  });
+});
+
 describe('createHandler', () => {
   it('renders the detected intent and the answer for a oneshot request', async () => {
     const { engine } = makeEngine(
@@ -459,13 +675,14 @@ describe('createHandler', () => {
     expect(stream.progress).not.toHaveBeenCalled();
   });
 
-  it('shows the model thinking as transient progress, never in the reply', async () => {
+  it('leaves thinking to VS Code\'s built-in indicator, never a custom label or the reasoning text', async () => {
     const reply: Reply = { intent: 'oneshot', reason: 'simple', answer: 'It is 4.' };
     const engine: Engine = {
       kind: 'local',
       startRun: (_request, client) => {
         client.onEvent({ type: 'triaged', intent: 'oneshot', reason: 'simple' });
         client.onEvent({ type: 'thinking', text: 'working it out' });
+        client.onEvent({ type: 'thinking', text: 'still working it out' });
         client.onEvent({ type: 'done', reply });
         return { result: Promise.resolve(reply), cancel: vi.fn() };
       },
@@ -480,10 +697,81 @@ describe('createHandler', () => {
       fakeToken() as any
     );
 
-    // Thinking surfaces as a transient progress line, prefixed so it reads as
-    // reasoning, and is dropped from the appended reply markdown.
-    expect(stream.progress).toHaveBeenCalledWith('Thinking: working it out');
+    // No custom progress label: VS Code's own built-in indicator stands in for the
+    // whole burst, so we never call stream.progress for thinking. The reasoning
+    // text is never shown, and nothing of it lands in the reply markdown.
+    expect(stream.progress).not.toHaveBeenCalled();
     expect(emitted(stream)).not.toContain('working it out');
+  });
+
+  it('appends a "Thought for Ns" line after a reasoning model finishes (default on)', async () => {
+    // Drive Date.now so the thinking burst (the thinking event to the next real
+    // output) spans a measurable second.
+    let clock = 1_000_000;
+    const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => (clock += 1000));
+    try {
+      const reply: Reply = { intent: 'oneshot', reason: 'simple', answer: 'It is 4.' };
+      const engine: Engine = {
+        kind: 'local',
+        startRun: (_request, client) => {
+          client.onEvent({ type: 'triaged', intent: 'oneshot', reason: 'simple' });
+          client.onEvent({ type: 'thinking', text: 'a' });
+          client.onEvent({ type: 'answer-delta', text: 'It is 4.' });
+          client.onEvent({ type: 'done', reply });
+          return { result: Promise.resolve(reply), cancel: vi.fn() };
+        },
+        startupWarnings: async () => [],
+      };
+      const stream = fakeStream();
+
+      await createHandler(() => engine, hostStub)(
+        { prompt: 'q', references: [] } as any,
+        { history: [] } as any,
+        stream as any,
+        fakeToken() as any
+      );
+
+      expect(emitted(stream)).toMatch(/_Thought for \d+s_/);
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
+  it('omits the thought-duration line when myDevTeam.thinking.showDuration is off', async () => {
+    __setConfig('myDevTeam.thinking.showDuration', false);
+    let clock = 1_000_000;
+    const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => (clock += 1000));
+    try {
+      const reply: Reply = { intent: 'oneshot', reason: 'simple', answer: 'It is 4.' };
+      const engine: Engine = {
+        kind: 'local',
+        startRun: (_request, client) => {
+          client.onEvent({ type: 'triaged', intent: 'oneshot', reason: 'simple' });
+          client.onEvent({ type: 'thinking', text: 'a' });
+          client.onEvent({ type: 'answer-delta', text: 'It is 4.' });
+          client.onEvent({ type: 'done', reply });
+          return { result: Promise.resolve(reply), cancel: vi.fn() };
+        },
+        startupWarnings: async () => [],
+      };
+      const stream = fakeStream();
+
+      await createHandler(() => engine, hostStub)(
+        { prompt: 'q', references: [] } as any,
+        { history: [] } as any,
+        stream as any,
+        fakeToken() as any
+      );
+
+      expect(emitted(stream)).not.toMatch(/Thought for/);
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
+  it('formats the thought-duration label by seconds and minutes', () => {
+    expect(messages.thinking.duration(12)).toBe('\n\n_Thought for 12s_');
+    expect(messages.thinking.duration(63)).toBe('\n\n_Thought for 1m 3s_');
   });
 
   it('renders a planning request as a checklist plus the execution transcript', async () => {
@@ -979,6 +1267,31 @@ describe('createHandler', () => {
   });
 });
 
+describe('sharedLinePrefixLength', () => {
+  it('rounds the shared prefix back to the start of the diverging line', () => {
+    const a = 'head\n**Plan:** B';
+    const b = 'head\n**Plan:** Add a feature';
+    // They diverge at the "B"/"Add" position; the offset is the start of the
+    // "**Plan:**" line (just past the "head\n" newline), so a re-render from it
+    // begins on a clean line.
+    const n = sharedLinePrefixLength(a, b);
+    expect(a.slice(0, n)).toBe('head\n');
+    expect(b.slice(n)).toBe('**Plan:** Add a feature');
+  });
+
+  it('returns 0 when the divergence is on the first line', () => {
+    expect(sharedLinePrefixLength('**Plan:** B', '**Plan:** A')).toBe(0);
+  });
+
+  it('keeps the lines shared before the diverging one', () => {
+    const a = 'l1\nl2\nl3-old';
+    const b = 'l1\nl2\nl3-new';
+    const n = sharedLinePrefixLength(a, b);
+    expect(a.slice(0, n)).toBe('l1\nl2\n');
+    expect(b.slice(n)).toBe('l3-new');
+  });
+});
+
 describe('renderReply plan complexity', () => {
   it('shows triage complexity in the triage block and planner complexity in the plan block (verbose)', () => {
     const reply: Reply = {
@@ -1008,6 +1321,68 @@ describe('renderReply plan complexity', () => {
       execution: anExecution,
     };
     expect(renderReply(reply, true)).not.toContain('**Complexity:**');
+  });
+});
+
+describe('renderReply direct route', () => {
+  it('renders the execution transcript with no plan block for a direct change', () => {
+    const reply: Reply = {
+      intent: 'direct',
+      reason: 'small edit',
+      complexity: 'simple',
+      execution: {
+        events: [
+          { kind: 'tool', tool: 'edit', input: 'config.ts', result: 'Edited config.ts.' },
+          { kind: 'text', text: 'Bumped the timeout.' },
+        ],
+      },
+    };
+    const text = renderReply(reply, true, 'verbose');
+    expect(text).toContain('**Detected intent:** `direct`');
+    // No plan block, but the execution transcript renders.
+    expect(text).not.toContain('**Plan:**');
+    expect(text).toContain('**Edit File** `config.ts`');
+    expect(text).toContain('Bumped the timeout.');
+  });
+});
+
+describe('renderReply clarify route', () => {
+  it('renders each question with numbered options and the free-form note', () => {
+    const reply: Reply = {
+      intent: 'clarify',
+      reason: 'ambiguous request',
+      questions: [
+        { question: 'Which database do you mean?', options: ['Postgres', 'SQLite'], allowOther: true },
+      ],
+    };
+    const text = renderReply(reply, true, 'verbose');
+    expect(text).toContain('**Detected intent:** `clarify`');
+    expect(text).toContain('Which database do you mean?');
+    expect(text).toContain('1. Postgres');
+    expect(text).toContain('2. SQLite');
+    expect(text).toContain('Or reply in your own words.');
+    // A terminal route: no plan, execution, or answer block.
+    expect(text).not.toContain('**Plan:**');
+    expect(text).not.toContain('**Answer:**');
+  });
+
+  it('omits the free-form note when a question disallows it', () => {
+    const reply: Reply = {
+      intent: 'clarify',
+      reason: 'ambiguous',
+      questions: [{ question: 'Pick one', options: ['A', 'B'], allowOther: false }],
+    };
+    const text = renderReply(reply, true, 'verbose');
+    expect(text).not.toContain('Or reply in your own words.');
+  });
+
+  it('streams nothing for clarify until the questions arrive (no questions yet)', () => {
+    // A mid-run snapshot has the route but not the questions, so only the triage
+    // block renders - the questions block is appended at finish.
+    const partial: ReplyProgress = { intent: 'clarify', reason: 'ambiguous' };
+    const text = renderReply(partial, false, 'verbose');
+    expect(text).toContain('**Detected intent:** `clarify`');
+    expect(text).not.toContain('A quick question');
   });
 });
 
@@ -1057,6 +1432,111 @@ describe('renderReply verbosity modes', () => {
     for (let i = 1; i < renders.length; i++) {
       expect(renders[i].startsWith(renders[i - 1])).toBe(true);
     }
+  });
+
+  // A built-in tool's result and snippet are its bulky output (file content,
+  // command output, or matches). Verbose shows it; default shows only the tool
+  // name and key argument (a failed call still surfaces its error).
+  const execReply = (events: ExecutionResult['events']): Reply => ({
+    intent: 'planning',
+    reason: 'needs steps',
+    plan: aPlan,
+    execution: { events },
+  });
+
+  const allTools: ExecutionResult['events'] = [
+    { kind: 'tool', tool: 'read', input: 'a.md', result: 'the file body' },
+    { kind: 'tool', tool: 'search', input: '{"query":"foo"}', result: 'src/a.ts' },
+    { kind: 'tool', tool: 'run', input: '{"command":"npm test"}', result: '42 passing' },
+    {
+      kind: 'tool',
+      tool: 'write',
+      input: 'b.py',
+      snippet: 'line one\nline two',
+      result: 'Wrote b.py (17 bytes).',
+    },
+    {
+      kind: 'tool',
+      tool: 'edit',
+      input: 'c.ts',
+      snippet: 'changed line',
+      result: 'Edited c.ts.',
+    },
+  ];
+
+  it('verbose shows every tool result and the write/edit snippets', () => {
+    const text = renderReply(execReply(allTools), true, 'verbose');
+    expect(text).toContain('**Read File** `a.md` → `the file body`');
+    expect(text).toContain('**Search Files** `{"query":"foo"}` → `src/a.ts`');
+    expect(text).toContain('**Run Command** `{"command":"npm test"}` → `42 passing`');
+    expect(text).toContain('**Write File** `b.py` → `Wrote b.py (17 bytes).`');
+    expect(text).toContain('````\nline one\nline two\n````');
+    expect(text).toContain('````\nchanged line\n````');
+  });
+
+  it('default hides every tool result and snippet, keeping name and key argument', () => {
+    const text = renderReply(execReply(allTools), true, 'default');
+    // The call lines (tool name and key argument) still render.
+    expect(text).toContain('**Read File** `a.md`');
+    expect(text).toContain('**Search Files** `{"query":"foo"}`');
+    expect(text).toContain('**Run Command** `{"command":"npm test"}`');
+    expect(text).toContain('**Write File** `b.py`');
+    expect(text).toContain('**Edit File** `c.ts`');
+    // None of the bulky output - results, command output, matches, or snippets.
+    expect(text).not.toContain('the file body');
+    expect(text).not.toContain('src/a.ts');
+    expect(text).not.toContain('42 passing');
+    expect(text).not.toContain('Wrote b.py');
+    expect(text).not.toContain('Edited c.ts');
+    expect(text).not.toContain('line one');
+    expect(text).not.toContain('changed line');
+    expect(text).not.toContain('````');
+    expect(text).not.toContain('→');
+  });
+
+  it('default still surfaces a failed tool call so the error is not hidden', () => {
+    const text = renderReply(
+      execReply([
+        {
+          kind: 'tool',
+          tool: 'read',
+          input: '../x',
+          result: 'Path is outside the workspace: ../x',
+          failed: true,
+        },
+      ]),
+      true,
+      'default'
+    );
+    expect(text).toContain('→ **failed** `Path is outside the workspace: ../x`');
+  });
+
+  it('default does not gate an unknown (dynamic/MCP) tool - its result still shows', () => {
+    const text = renderReply(
+      execReply([{ kind: 'tool', tool: 'mystery', input: '{}', result: 'mcp output' }]),
+      true,
+      'default'
+    );
+    expect(text).toContain('**mystery** `{}` → `mcp output`');
+  });
+
+  it('default keeps streamed tool renders prefix-extensions across the result', () => {
+    // A run call: pending (no result) then settled. In default mode neither
+    // render shows the output, so the settled render must still extend the
+    // pending one.
+    const pending = renderReply(
+      execReply([{ kind: 'tool', tool: 'run', input: '{"command":"npm test"}' }]),
+      false,
+      'default'
+    );
+    const settled = renderReply(
+      execReply([
+        { kind: 'tool', tool: 'run', input: '{"command":"npm test"}', result: '42 passing' },
+      ]),
+      false,
+      'default'
+    );
+    expect(settled.startsWith(pending)).toBe(true);
   });
 });
 
@@ -1574,110 +2054,207 @@ describe('createHandler conversation history', () => {
   });
 });
 
-describe('createHandler side questions', () => {
-  /** Run the handler and capture the agent prompts, the stream, and the result. */
-  async function handle(prompt: string, history: unknown[] = [], command?: string) {
-    const { engine, seen } = makeEngine();
+describe('createHandler auto-compaction', () => {
+  const reply: Reply = { intent: 'oneshot', reason: 'simple', answer: 'ok' };
+
+  function warning(percent: number): RunEvent {
+    return {
+      type: 'context-warning',
+      warning: {
+        model: 'qwen3:8b',
+        threshold: percent,
+        percent,
+        usedTokens: 1000,
+        contextWindow: 1000,
+        estimated: false,
+      },
+    };
+  }
+
+  /** A scripted run: emit the given events, then settle with a oneshot reply. */
+  function emitting(events: RunEvent[]): Engine {
+    return {
+      kind: 'local',
+      startRun: (_request, client) => {
+        for (const e of events) client.onEvent(e);
+        client.onEvent({ type: 'done', reply });
+        return { result: Promise.resolve(reply), cancel: vi.fn() };
+      },
+      startupWarnings: async () => [],
+    };
+  }
+
+  it('offers a "Compact now" action below the auto-compact threshold', async () => {
     const stream = fakeStream();
-    const result = await createHandler(() => engine, hostStub)(
-      { prompt, command, references: [] } as any,
-      { history } as any,
+    await createHandler(() => emitting([warning(80)]), hostStub)(
+      { prompt: 'go', references: [] } as any,
+      { history: [] } as any,
       stream as any,
       fakeToken() as any
     );
-    return { seen, stream, result };
-  }
 
-  /** A response turn carrying the TurnMetadata the handler stores per turn. */
-  function responseTurn(
-    text: string,
-    metadata: { command: string; outcome?: string; conversationId?: string }
-  ) {
-    return new ChatResponseTurn(
-      [new ChatResponseMarkdownPart(text)],
-      undefined,
-      { metadata: { runId: 'r', ...metadata } }
+    const text = emitted(stream);
+    expect(text).toContain('Compact now');
+    expect(text).toContain(`command:${COMPACT_NOW_COMMAND_ID}`);
+    expect(text).not.toContain('compacted automatically');
+  });
+
+  it('flags an automatic compaction (no button) at or above the threshold', async () => {
+    const stream = fakeStream();
+    await createHandler(() => emitting([warning(96)]), hostStub)(
+      { prompt: 'go', references: [] } as any,
+      { history: [] } as any,
+      stream as any,
+      fakeToken() as any
     );
-  }
 
-  it('routes a "btw" prompt as the pinned /ask route with the marker stripped', async () => {
-    const { seen, stream, result } = await handle('btw how do I sort an array in Python?');
-
-    // The route is pinned: the triage model is never called...
-    expect(seen.triage).toBeUndefined();
-    expect(emitted(stream)).toContain('Requested via /ask.');
-    // ...and the answerer sees the question without the marker, framed by the
-    // ask preamble.
-    expect(seen.answerer).toContain('how do I sort an array in Python?');
-    expect(seen.answerer).toContain('side question');
-    expect(seen.answerer).not.toMatch(/btw/i);
-    // The turn records the ask command, which is what excludes its response
-    // from later turns' history.
-    expect((result?.metadata as { command?: string })?.command).toBe('ask');
+    const text = emitted(stream);
+    expect(text).toContain('compacted automatically');
+    expect(text).not.toContain(`command:${COMPACT_NOW_COMMAND_ID}`);
   });
 
-  it('accepts the marker in any case with trailing punctuation', async () => {
-    const { seen } = await handle('BTW, which is faster, a list or a tuple?');
-    expect(seen.answerer).toContain('which is faster, a list or a tuple?');
-    expect(seen.answerer).not.toMatch(/btw/i);
+  it('falls back to the button at the threshold when auto-compact is off', async () => {
+    __setConfig('myDevTeam.history.autoCompact', false);
+    const stream = fakeStream();
+    await createHandler(() => emitting([warning(96)]), hostStub)(
+      { prompt: 'go', references: [] } as any,
+      { history: [] } as any,
+      stream as any,
+      fakeToken() as any
+    );
+
+    const text = emitted(stream);
+    expect(text).toContain(`command:${COMPACT_NOW_COMMAND_ID}`);
+    expect(text).not.toContain('compacted automatically');
   });
 
-  it('runs a side question with no conversation history', async () => {
-    const { seen } = await handle('btw how do I sort a list?', [
-      new ChatRequestTurn('create a calculator'),
-      new ChatResponseTurn([new ChatResponseMarkdownPart('Created calculator.py.')]),
-    ]);
+  it('compacts the next turn after crossing the threshold, replacing prior turns with the summary', async () => {
+    const requests: any[] = [];
+    const summary: Reply = { intent: 'oneshot', reason: 'compact', answer: 'SUMMARY of work' };
+    const normal: Reply = { intent: 'oneshot', reason: 'simple', answer: 'ok' };
+    let mainRuns = 0;
+    const engine: Engine = {
+      kind: 'local',
+      startRun: (request, client) => {
+        requests.push(request);
+        const isCompact = request.command === 'compact';
+        if (!isCompact && ++mainRuns === 1) {
+          // The first (turn-1) run crosses the threshold and flags the thread.
+          client.onEvent(warning(96));
+        }
+        const result = isCompact ? summary : normal;
+        client.onEvent({ type: 'done', reply: result });
+        return { result: Promise.resolve(result), cancel: vi.fn() };
+      },
+      startupWarnings: async () => [],
+    };
+    const handler = createHandler(() => engine, hostStub);
+    // A prior assistant turn carrying the conversation id, so both turns resolve
+    // to the same conversation - the auto-compact flag is keyed by it.
+    const prior = new ChatResponseTurn(
+      [new ChatResponseMarkdownPart('earlier work')],
+      undefined,
+      { metadata: { runId: 'r', conversationId: 'C1' } }
+    );
 
-    expect(seen.answerer).not.toContain('--- Conversation so far ---');
-    expect(seen.answerer).not.toContain('create a calculator');
+    await handler(
+      { prompt: 'first', references: [] } as any,
+      { history: [prior] } as any,
+      fakeStream() as any,
+      fakeToken() as any
+    );
+    await handler(
+      { prompt: 'second', references: [] } as any,
+      { history: [prior] } as any,
+      fakeStream() as any,
+      fakeToken() as any
+    );
+
+    // A hidden /compact ran between the two real runs...
+    expect(requests.map((r) => r.command)).toEqual([undefined, 'compact', undefined]);
+    // ...and turn 2's run sees the summary in place of the prior turns.
+    expect(requests[2].history).toEqual([{ role: 'assistant', text: 'SUMMARY of work' }]);
   });
 
-  it('keeps prior side questions out of a later turn\'s history', async () => {
-    const { seen } = await handle('now rename it too', [
-      new ChatRequestTurn('create a calculator'),
-      new ChatResponseTurn([new ChatResponseMarkdownPart('Created calculator.py.')]),
-      // A "btw" side question and its answer...
-      new ChatRequestTurn('btw how do I sort a list?'),
-      responseTurn('Use sorted().', { command: 'ask', outcome: 'ok' }),
-      // ...and an explicit /ask turn and its answer.
-      new ChatRequestTurn('what is a tuple?', 'ask'),
-      responseTurn('An immutable sequence.', { command: 'ask', outcome: 'ok' }),
-    ]);
+  it('feeds the full conversation to a /compact run, beyond the standing caps', async () => {
+    let captured: any;
+    const engine: Engine = {
+      kind: 'local',
+      startRun: (request, client) => {
+        captured = request;
+        client.onEvent({ type: 'done', reply });
+        return { result: Promise.resolve(reply), cancel: vi.fn() };
+      },
+      startupWarnings: async () => [],
+    };
+    // More turns than the standing count cap, and one longer than the per-turn cap.
+    const longTurn = 'x'.repeat(settings.history.maxTurnChars + 5000);
+    const history = [
+      new ChatRequestTurn(longTurn),
+      ...Array.from(
+        { length: settings.history.maxTurns + 5 },
+        (_, i) => new ChatRequestTurn(`turn ${i}`)
+      ),
+    ];
 
-    // The real conversation survives; neither side question leaked into it.
-    expect(seen.answerer).toContain('User: create a calculator');
-    expect(seen.answerer).toContain('Assistant: Created calculator.py.');
-    expect(seen.answerer).not.toContain('sort a list');
-    expect(seen.answerer).not.toContain('sorted()');
-    expect(seen.answerer).not.toContain('tuple');
+    await createHandler(() => engine, hostStub)(
+      { prompt: '', references: [], command: 'compact' } as any,
+      { history } as any,
+      fakeStream() as any,
+      fakeToken() as any
+    );
+
+    // All turns are kept (more than the standing maxTurns)...
+    expect(captured.history.length).toBeGreaterThan(settings.history.maxTurns);
+    // ...and the long turn is not truncated to the standing per-turn cap.
+    const long = captured.history.find((t: any) => t.text.startsWith('x'));
+    expect(long.text.length).toBeGreaterThan(settings.history.maxTurnChars);
   });
 
-  it('resumes the conversation id past a side-question turn', async () => {
-    const { result } = await handle('now rename it too', [
-      new ChatRequestTurn('create a calculator'),
-      responseTurn('Created calculator.py.', { command: '', conversationId: 'main' }),
-      new ChatRequestTurn('btw how do I sort a list?'),
-      responseTurn('Use sorted().', { command: 'ask', conversationId: 'aside' }),
-    ]);
+  it('preserves a long auto-compaction summary beyond the standing per-turn cap', async () => {
+    const requests: any[] = [];
+    const longSummary = 'S'.repeat(settings.history.maxTurnChars + 3000);
+    const summary: Reply = { intent: 'oneshot', reason: 'compact', answer: longSummary };
+    const normal: Reply = { intent: 'oneshot', reason: 'simple', answer: 'ok' };
+    let mainRuns = 0;
+    const engine: Engine = {
+      kind: 'local',
+      startRun: (request, client) => {
+        requests.push(request);
+        const isCompact = request.command === 'compact';
+        if (!isCompact && ++mainRuns === 1) {
+          client.onEvent(warning(96));
+        }
+        const result = isCompact ? summary : normal;
+        client.onEvent({ type: 'done', reply: result });
+        return { result: Promise.resolve(result), cancel: vi.fn() };
+      },
+      startupWarnings: async () => [],
+    };
+    const handler = createHandler(() => engine, hostStub);
+    const prior = new ChatResponseTurn(
+      [new ChatResponseMarkdownPart('earlier work')],
+      undefined,
+      { metadata: { runId: 'r', conversationId: 'C1' } }
+    );
 
-    // The follow-up continues the real thread, not the side question's.
-    expect((result?.metadata as { conversationId?: string })?.conversationId).toBe('main');
-  });
+    await handler(
+      { prompt: 'first', references: [] } as any,
+      { history: [prior] } as any,
+      fakeStream() as any,
+      fakeToken() as any
+    );
+    await handler(
+      { prompt: 'second', references: [] } as any,
+      { history: [prior] } as any,
+      fakeStream() as any,
+      fakeToken() as any
+    );
 
-  it('leaves a prompt that merely mentions btw on the normal route', async () => {
-    const { seen } = await handle('the btw flag is broken, fix it');
-    // Triage ran (nothing was pinned) and saw the untouched prompt.
-    expect(seen.triage).toBe('the btw flag is broken, fix it');
-  });
-
-  it('leaves a word merely starting with btw on the normal route', async () => {
-    const { seen } = await handle('btware needs an update');
-    expect(seen.triage).toBe('btware needs an update');
-  });
-
-  it('leaves a bare "btw" with no question on the normal route', async () => {
-    const { seen } = await handle('btw');
-    expect(seen.triage).toBe('btw');
+    // The summary survives at its full length (within the richer summary cap),
+    // not truncated to a normal turn's size.
+    expect(requests[2].history[0].text).toHaveLength(longSummary.length);
+    expect(longSummary.length).toBeGreaterThan(settings.history.maxTurnChars);
   });
 });
 
@@ -1869,7 +2446,7 @@ describe('createHandler streaming', () => {
     expect(count(text, 'It is 4.')).toBe(1);
   });
 
-  it('falls back to the complete reply when a snapshot is inconsistent', async () => {
+  it('re-emits only the diverged tail when a snapshot is inconsistent', async () => {
     const { engine } = makeEngine(
       async () => ({ intent: 'planning', reason: 'needs steps' }),
       async (_prompt, onPartial) => {
@@ -1887,10 +2464,15 @@ describe('createHandler streaming', () => {
       fakeToken() as any
     );
 
-    // The full reply is still rendered after the stale streamed prefix.
+    // The corrected reply still lands in full...
     const text = emitted(stream);
     expect(text).toContain('**Plan:** Add a feature');
     expect(text).toContain('1. **Find the file** - locate it');
+    // ...but only the diverged tail (the plan) is re-emitted: the unchanged
+    // head (intent, reason, model) is not printed a second time.
+    expect(count(text, '**Detected intent:**')).toBe(1);
+    expect(count(text, '**Reason:**')).toBe(1);
+    expect(count(text, '**Model:**')).toBe(1);
   });
 
   it('separates a planner failure from already-streamed output', async () => {
@@ -2068,6 +2650,34 @@ describe('renderReply', () => {
     expect(executionAt).toBeGreaterThan(planAt);
     expect(text).toContain('**Search Files** `{"query":"*"}` → `src/a.ts`');
     expect(text).toContain('All steps are done.');
+  });
+
+  it('shows the executor model in the execution header, not the upfront model block', () => {
+    // The executor entry is sized only once the plan is drafted, so it rides in
+    // the execution header (settled, append-only) and is kept out of the upfront
+    // "Model:" block - which is what stopped the whole reply re-rendering when
+    // the executor's tier was corrected mid-stream.
+    const reply: ReplyProgress = {
+      intent: 'planning',
+      reason: 'needs steps',
+      selection: {
+        mode: 'auto',
+        models: [
+          { step: 'triage', id: 't', label: 'Triage-M' },
+          { step: 'plan', id: 'p', label: 'Planner-M' },
+          { step: 'execute', id: 'e', label: 'Executor-M' },
+        ],
+      },
+      plan: aPlan,
+      execution: anExecution,
+    };
+    const text = renderReply(reply, true);
+    // The upfront model block names the planner but never the executor...
+    const modelBlock = text.slice(0, text.indexOf('**Plan:**'));
+    expect(modelBlock).toContain('Planner-M');
+    expect(modelBlock).not.toContain('Executor-M');
+    // ...which appears in the execution header instead.
+    expect(text).toContain('**Execution:** _(Executor-M)_');
   });
 
   it('renders growing execution snapshots as prefix-extensions of each other', () => {
@@ -2352,6 +2962,64 @@ describe('renderReply', () => {
     const final = renderReply(withSummary(aSummary), true);
     expect(final.startsWith(previous)).toBe(true);
   });
+
+  // A mid-run snapshot whose last tool call is still pending (no result yet)
+  // while the engine has already produced a summary. The summary must be
+  // withheld until the transcript finishes: appending it onto a transcript cut
+  // short at the pending call would ship it ahead of the result that lands
+  // later, and the append-only chat could only re-add that result after the
+  // summary - the out-of-order, duplicated-summary transcript. Regression.
+  const pendingExecution: PartialExecution = {
+    events: [
+      { kind: 'tool', tool: 'write', input: 'a.py', result: 'wrote a.py' },
+      { kind: 'tool', tool: 'run', input: 'python a.py' }, // awaiting its result
+    ],
+  };
+  const pendingReply = (): ReplyProgress => ({
+    intent: 'planning',
+    reason: 'needs steps',
+    plan: aPlan,
+    execution: pendingExecution,
+    summary: aSummary,
+  });
+
+  it('withholds the summary while the transcript is truncated at a pending tool call', () => {
+    const text = renderReply(pendingReply(), false);
+    // The completed write renders, but nothing past the pending call - no summary.
+    expect(text).toContain('wrote a.py');
+    expect(text).not.toContain('**Summary:**');
+  });
+
+  it('keeps streamed renders prefix-extensions across the pending call resolving', () => {
+    const pending = renderReply(pendingReply(), false);
+    const resolved = renderReply(
+      {
+        intent: 'planning',
+        reason: 'needs steps',
+        plan: aPlan,
+        execution: {
+          events: [
+            { kind: 'tool', tool: 'write', input: 'a.py', result: 'wrote a.py' },
+            { kind: 'tool', tool: 'run', input: 'python a.py', result: 'ran ok' },
+          ],
+        },
+        summary: aSummary,
+      },
+      false
+    );
+    // The resolved snapshot extends the pending one (the run result and then the
+    // summary append after it), so the chat never has to re-dump a diverged tail.
+    expect(resolved.startsWith(pending)).toBe(true);
+    expect(resolved).toContain('**Summary:**');
+  });
+
+  it('still renders the summary at done even if the last tool call has no result', () => {
+    // The finish render is never truncated (done renders past a pending call), so
+    // a declined or killed final command must not swallow the summary.
+    const text = renderReply(pendingReply(), true);
+    expect(text).toContain('**Summary:**');
+    expect(text).toContain('**What ships:** A change line');
+  });
 });
 
 describe('module constants', () => {
@@ -2383,9 +3051,11 @@ describe('createHandler protocol envelope', () => {
     );
 
     expect(captured).toMatchObject({
-      protocolVersion: 3,
+      protocolVersion: 5,
       prompt: 'hi',
-      offeredTools: ['read', 'search', 'run', 'write', 'edit'],
+      // The workspace tools plus the engine-built `skill` tool (always offered);
+      // `clarify` is absent here since no clarify prompt was wired.
+      offeredTools: ['read', 'search', 'run', 'write', 'edit', 'skill'],
     });
     expect((captured as { environment: object }).environment).toMatchObject({
       os: expect.any(String),
@@ -2393,26 +3063,163 @@ describe('createHandler protocol envelope', () => {
     });
   });
 
-  it('hands the engine the ToolHost it should execute tools with', async () => {
-    let receivedHost: ToolHost | undefined;
+  it('hands the engine a serializing host that delegates to the real ToolHost', async () => {
+    // The host the engine receives wraps the real ToolHost to run a step's tool
+    // calls one at a time, in call order - it is no longer the raw stub. It must
+    // still offer the same tools and delegate each `tool` invoke to the underlying
+    // host.
+    const order: string[] = [];
+    const recordingHost: ToolHost = {
+      tools: ['read', 'search', 'run', 'write', 'edit'],
+      execute: async (tool) => {
+        // Yield so a concurrent caller would interleave without serialization.
+        await Promise.resolve();
+        order.push(tool);
+        return `${tool}-ok`;
+      },
+    };
+    let received: RunClient | undefined;
     const engine: Engine = {
       kind: 'local',
       startRun: (_request, client) => {
-        receivedHost = client.toolHost;
+        received = client;
         const reply = { intent: 'oneshot' as const, reason: 'x', answer: 'ok' };
         return { result: Promise.resolve(reply), cancel: () => {} };
       },
       startupWarnings: async () => [],
     };
 
-    await createHandler(() => engine, hostStub)(
+    await createHandler(() => engine, recordingHost)(
       { prompt: 'hi', references: [] } as any,
       { history: [] } as any,
       fakeStream() as any,
       fakeToken() as any
     );
 
-    expect(receivedHost).toBe(hostStub);
+    expect(received).toBeDefined();
+    // The offered tools are the real ToolHost's plus the engine-built `skill`.
+    expect(received!.tools).toEqual([...recordingHost.tools, 'skill']);
+
+    // Fire several calls at once: the wrapper must run them in submission order
+    // and pass each tool/result straight through to the underlying host.
+    const results = await Promise.all([
+      received!.invoke('tool', { tool: 'write', args: {} }),
+      received!.invoke('tool', { tool: 'write', args: {} }),
+      received!.invoke('tool', { tool: 'run', args: {} }),
+    ]);
+    expect(order).toEqual(['write', 'write', 'run']);
+    expect(results).toEqual(['write-ok', 'write-ok', 'run-ok']);
+  });
+
+  it('yields the event loop before running a tool, so async renders flush first', async () => {
+    // The wrapper must not run a tool synchronously: it yields a macrotask first,
+    // so the previous call's result (delivered to the chat asynchronously) renders
+    // before this call's synchronous approval prompt. A microtask scheduled right
+    // after the call therefore runs before the tool body.
+    const order: string[] = [];
+    const host: ToolHost = {
+      tools: ['run'],
+      execute: async () => {
+        order.push('tool-body');
+        return 'ok';
+      },
+    };
+    let received: RunClient | undefined;
+    const engine: Engine = {
+      kind: 'local',
+      startRun: (_request, client) => {
+        received = client;
+        const reply = { intent: 'oneshot' as const, reason: 'x', answer: 'ok' };
+        return { result: Promise.resolve(reply), cancel: () => {} };
+      },
+      startupWarnings: async () => [],
+    };
+
+    await createHandler(() => engine, host)(
+      { prompt: 'hi', references: [] } as any,
+      { history: [] } as any,
+      fakeStream() as any,
+      fakeToken() as any
+    );
+
+    const p = received!.invoke('tool', { tool: 'run', args: {} });
+    // A microtask drains before the macrotask the wrapper waits on, so this lands
+    // ahead of the tool body - proving the wrapper yielded rather than running it
+    // synchronously.
+    await Promise.resolve();
+    order.push('after-microtask');
+    await p;
+    expect(order).toEqual(['after-microtask', 'tool-body']);
+  });
+});
+
+describe('createHandler engine-built model tools', () => {
+  /** Capture the run client the handler hands the engine, then settle. */
+  function capturingEngine(): { engine: Engine; client: () => RunClient } {
+    let captured: RunClient | undefined;
+    const engine: Engine = {
+      kind: 'local',
+      startRun: (_request, c) => {
+        captured = c;
+        const reply = { intent: 'oneshot' as const, reason: 'x', answer: 'ok' };
+        return { result: Promise.resolve(reply), cancel: () => {} };
+      },
+      startupWarnings: async () => [],
+    };
+    return { engine, client: () => captured! };
+  }
+
+  it('dispatches a clarify tool call to the clarify prompt and formats the answers', async () => {
+    // `clarify` is a client call now: it routes to the clarify prompt (not the
+    // ToolHost), and the client composes the model-facing answer string.
+    const ask = vi.fn(async () => [{ question: 'Which feature?', answer: 'the CLI' }]);
+    const clarifyPrompt = { ask } as any;
+    const { engine, client } = capturingEngine();
+    await createHandler(
+      () => engine,
+      hostStub,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      clarifyPrompt
+    )(
+      { prompt: 'hi', references: [] } as any,
+      { history: [] } as any,
+      fakeStream() as any,
+      fakeToken() as any
+    );
+
+    const out = (await client().invoke('tool', {
+      tool: 'clarify',
+      args: { questions: [{ question: 'Which feature?', options: [], allowOther: true }] },
+    })) as string;
+    expect(ask).toHaveBeenCalled();
+    expect(out).toContain('The user answered');
+    expect(out).toContain('the CLI');
+  });
+
+  it('dispatches a skill tool call for an unknown skill to a notice (no ToolHost call)', async () => {
+    // With no skills collected, a `skill` call resolves to a recoverable notice
+    // the client composes - it never reaches the workspace ToolHost.
+    const execute = vi.fn(async () => 'should not be called');
+    const { engine, client } = capturingEngine();
+    await createHandler(() => engine, { tools: [], execute })(
+      { prompt: 'hi', references: [] } as any,
+      { history: [] } as any,
+      fakeStream() as any,
+      fakeToken() as any
+    );
+
+    const out = (await client().invoke('tool', {
+      tool: 'skill',
+      args: { name: 'nope' },
+    })) as string;
+    expect(out).toContain('No skill named "nope"');
+    expect(execute).not.toHaveBeenCalled();
   });
 });
 

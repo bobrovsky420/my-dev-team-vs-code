@@ -14,18 +14,34 @@ const base: RuntimeConfig = {
   disabledProviders: [],
   disabledModels: [],
   triageModel: '',
+  triageMode: 'classifier',
   complexityRoutingEnabled: true,
   requestsPerMinute: undefined,
   toolSnippetLines: 5,
   planApproval: 'auto',
   thinkingShowInChat: true,
   summaryShowInChat: true,
+  clarifyEnabled: true,
 };
 
 describe('runtimeConfig injection', () => {
   it('returns whatever was last injected', () => {
     setRuntimeConfig({ ...base, triageModel: 'anthropic' });
     expect(runtimeConfig().triageModel).toBe('anthropic');
+  });
+
+  it('carries the triage mode (combined vs classifier) through the seam', () => {
+    setRuntimeConfig({ ...base, triageMode: 'combined' });
+    expect(runtimeConfig().triageMode).toBe('combined');
+    setRuntimeConfig({ ...base, triageMode: 'classifier' });
+    expect(runtimeConfig().triageMode).toBe('classifier');
+  });
+
+  it('carries the clarify-enabled flag through the seam', () => {
+    setRuntimeConfig({ ...base, clarifyEnabled: false });
+    expect(runtimeConfig().clarifyEnabled).toBe(false);
+    setRuntimeConfig({ ...base, clarifyEnabled: true });
+    expect(runtimeConfig().clarifyEnabled).toBe(true);
   });
 
   it('the engine rate limiter reads the injected user override', () => {

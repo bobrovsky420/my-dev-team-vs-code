@@ -75,6 +75,80 @@ async function readLocation(uri: vscode.Uri, range: vscode.Range): Promise<Attac
   };
 }
 
+/**
+ * The Uris an explicit reference set already covers, used to de-dupe the active
+ * editor: when the user attached the open file (or VS Code sent its implicit
+ * current-file reference), the auto-attach below must not add it a second time.
+ */
+function referencedUris(references: readonly vscode.ChatPromptReference[]): Set<string> {
+  const uris = new Set<string>();
+  for (const ref of references) {
+    const v = ref.value;
+    if (v instanceof vscode.Uri) {
+      uris.add(v.toString());
+    } else if (v instanceof vscode.Location) {
+      uris.add(v.uri.toString());
+    } else if (isLocationLike(v)) {
+      uris.add(v.uri.toString());
+    }
+  }
+  return uris;
+}
+
+/**
+ * Resolve the active editor into an attachment - the whole open file, or just
+ * the selection when text is selected - so "the current file"/"this selection"
+ * has a concrete referent without the user attaching anything, the way Copilot
+ * always includes the open editor. The deixis is resolved here, on the client,
+ * rather than left to the model (a small local model just hallucinates a literal
+ * path like `current_file_path`). Returns the attachment plus the editor's Uri
+ * (for de-duping against explicit references), or undefined when the setting is
+ * off or no editor is active.
+ *
+ * The text comes from the in-memory document (so unsaved edits are included,
+ * matching what the user sees) and is capped like any other attachment. The
+ * document is already open, so there is no disk read or size guard to apply -
+ * the char cap bounds what reaches the prompt.
+ */
+function resolveActiveEditor(): { attachment: Attachment; uri: vscode.Uri } | undefined {
+  if (!settings.attachActiveEditorEnabled) {
+    return undefined;
+  }
+  const editor = vscode.window.activeTextEditor;
+  if (!editor) {
+    return undefined;
+  }
+  const doc = editor.document;
+  const uri = doc.uri;
+  const rel = vscode.workspace.asRelativePath(uri);
+  const sel = editor.selection;
+  // Compute emptiness from the positions rather than `selection.isEmpty`, so
+  // this works against the in-memory test fake (whose Range carries no methods)
+  // as well as a real vscode.Selection.
+  const hasSelection =
+    !!sel &&
+    (sel.start.line !== sel.end.line || sel.start.character !== sel.end.character);
+  if (hasSelection) {
+    const startLine = sel.start.line + 1;
+    const endLine = sel.end.line + 1;
+    const where = endLine > startLine ? `(lines ${startLine}-${endLine})` : `(line ${startLine})`;
+    return {
+      uri,
+      attachment: {
+        label: `Active selection in ${rel} ${where}`,
+        text: truncateForDisplay(doc.getText(sel), settings.maxAttachmentChars),
+      },
+    };
+  }
+  return {
+    uri,
+    attachment: {
+      label: `Active file: ${rel}`,
+      text: truncateForDisplay(doc.getText(), settings.maxAttachmentChars),
+    },
+  };
+}
+
 /** Turn one explicit reference into an attachment; never throws. */
 async function resolveReference(ref: vscode.ChatPromptReference): Promise<Attachment> {
   const v = ref.value;
@@ -191,31 +265,77 @@ async function resolveCodebase(prompt: string): Promise<Attachment> {
   return { label, text: truncateForDisplay(text, settings.references.codebaseMaxChars) };
 }
 
+/** True when an execFile rejection was the stdout maxBuffer overflow. */
+export function isMaxBufferError(err: unknown): boolean {
+  const e = err as { code?: string; message?: string } | null;
+  return (
+    !!e &&
+    (e.code === 'ERR_CHILD_PROCESS_STDOUT_MAXBUFFER' ||
+      /maxBuffer/i.test(String(e.message ?? '')))
+  );
+}
+
+/** One git invocation's outcome: its stdout, and whether it overflowed the buffer. */
+interface GitRun {
+  out: string;
+  overflow: boolean;
+}
+
+/**
+ * Build the `#changes` text from a git runner. When either full diff overflowed
+ * the read buffer, it falls back to a compact `--stat` summary (per-file line
+ * counts, far smaller than the diff) prefixed with a notice, rather than
+ * returning empty - a big working tree must never be misreported as "no changes"
+ * (the overflow used to be swallowed into `''`, so `#changes` told the agent
+ * there was nothing to review; see FIX.md, finding B-2). The runner reports a
+ * non-overflow failure (no git, not a repo) as empty, which stays "no changes".
+ * Exported for tests, which inject a fake runner instead of a git repo.
+ */
+export async function buildGitDiff(
+  run: (args: string[]) => Promise<GitRun>
+): Promise<string> {
+  const staged = await run(['diff', '--staged']);
+  const unstaged = await run(['diff']);
+
+  if (staged.overflow || unstaged.overflow) {
+    const stagedStat = (await run(['diff', '--staged', '--stat'])).out.trim();
+    const unstagedStat = (await run(['diff', '--stat'])).out.trim();
+    const parts: string[] = [messages.references.changesTooLarge];
+    if (stagedStat) {
+      parts.push('# Staged changes (summary)\n' + stagedStat);
+    }
+    if (unstagedStat) {
+      parts.push('# Unstaged changes (summary)\n' + unstagedStat);
+    }
+    return parts.join('\n\n');
+  }
+
+  const parts: string[] = [];
+  if (staged.out.trim()) {
+    parts.push('# Staged changes\n' + staged.out.trim());
+  }
+  if (unstaged.out.trim()) {
+    parts.push('# Unstaged changes\n' + unstaged.out.trim());
+  }
+  return parts.join('\n\n');
+}
+
 /** The default `#changes` resolver: the workspace's staged + unstaged git diff. */
 async function defaultGitDiff(cwd: string): Promise<string> {
-  const run = async (args: string[]): Promise<string> => {
+  return buildGitDiff(async (args) => {
     try {
       const { stdout } = await execFileAsync('git', args, {
         cwd,
         maxBuffer: settings.runCommandMaxBufferBytes,
         windowsHide: true,
       });
-      return String(stdout);
-    } catch {
-      // No git, not a repo, or the command failed: treat as no changes.
-      return '';
+      return { out: String(stdout), overflow: false };
+    } catch (err) {
+      // No git, not a repo, or the command failed: treat as no changes - except
+      // a buffer overflow, which means there *are* changes, just too many to read.
+      return { out: '', overflow: isMaxBufferError(err) };
     }
-  };
-  const staged = (await run(['diff', '--staged'])).trim();
-  const unstaged = (await run(['diff'])).trim();
-  const parts: string[] = [];
-  if (staged) {
-    parts.push('# Staged changes\n' + staged);
-  }
-  if (unstaged) {
-    parts.push('# Unstaged changes\n' + unstaged);
-  }
-  return parts.join('\n\n');
+  });
 }
 
 /** Resolve `#changes`: the uncommitted git diff, or a notice when there is none. */
@@ -275,6 +395,16 @@ export async function collectReferences(
   }
   if (wantsCodebase) {
     attachments.push(await resolveCodebase(cleaned));
+  }
+
+  // Always include the active editor as implicit context (Copilot-style), so a
+  // bare "analyse the current file" works even when the user attached nothing.
+  // Skipped when that same file is already attached - explicitly, or via VS
+  // Code's own implicit current-file reference - so it never doubles. Added last
+  // so the user's explicit references and inline markers lead the prompt.
+  const active = resolveActiveEditor();
+  if (active && !referencedUris(references).has(active.uri.toString())) {
+    attachments.push(active.attachment);
   }
 
   return { attachments, prompt: cleaned };
