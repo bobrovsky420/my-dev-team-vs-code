@@ -91,6 +91,7 @@ so consumers can always trust what they read.
 | `groq.baseUrl` | `""` | Groq proxy/gateway base URL | **user wins** over backend default |
 | `deepseek.baseUrl` | `""` | DeepSeek proxy/gateway base URL | **user wins** over backend default |
 | `zai.baseUrl` | `""` | Z.AI (GLM) proxy/gateway base URL | **user wins** over backend default; unset -> deployment default -> Z.AI default (`https://api.z.ai/api/paas/v4`) |
+| `kimi.baseUrl` | `""` | Moonshot Kimi proxy/gateway base URL | **user wins** over backend default; unset -> deployment default -> Kimi default (`https://api.moonshot.ai/v1`) |
 | `provider.requestsPerMinute` | `null` (unset) | Override of the per-provider request rate; `0` disables throttling, `N` sets N/min | **user wins** over the backend per-provider default (either direction); unset defers to it |
 | `run.commandTimeoutMs` | `60000` | `run` tool shell-command timeout (ms) | - |
 | `run.allowedCommands` | `[]` | Command prefixes/globs the `run` tool runs without an approval prompt (e.g. `git status`, `npm test`, `npm run *`) | only a single, non-chained command matches; a denylisted command never matches; the "Always allow commands like this" choice appends here; invalid entries dropped |
@@ -143,6 +144,7 @@ which is which.
 | `providers.groq.baseUrl` | `""` | Groq base URL **default** | user `myDevTeam.groq.baseUrl` **wins** when set |
 | `providers.deepseek.baseUrl` | `""` | DeepSeek base URL **default** | user `myDevTeam.deepseek.baseUrl` **wins** when set |
 | `providers.zai.baseUrl` | `""` | Z.AI base URL **default** | user `myDevTeam.zai.baseUrl` **wins** when set; unset -> Z.AI default endpoint |
+| `providers.kimi.baseUrl` | `""` | Kimi base URL **default** | user `myDevTeam.kimi.baseUrl` **wins** when set; unset -> Kimi default endpoint |
 | `providers.<id>.requestsPerMinute` | `0` (per provider) | Per-provider request-rate **default** (requests/min; `0` = no throttle) | user `myDevTeam.provider.requestsPerMinute` **wins** when set (either direction); unset defers to it |
 | `agents.triage.model` | `"ollama"` | Triage routing **default**, used only when both `triage.model` and the work `model` are unset/`auto`: a model id pins it, a provider name routes by capability | user `triage.model` **wins** when set, then the work `model` when it names a concrete model/provider |
 

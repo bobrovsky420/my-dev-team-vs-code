@@ -59,6 +59,13 @@ describe('selectModel', () => {
     expect(exec.id).toBe('anthropic-opus'); // coding-heavy profile
   });
 
+  it('routes among the generated Kimi frontier models', () => {
+    const exec = selectModel(agents.executor.capabilities, 'provider:kimi');
+    expect(exec.provider).toBe('kimi');
+    expect(['kimi-k3', 'kimi-k27-code', 'kimi-k26']).toContain(exec.id);
+    expect(modelById('kimi-k27-code-highspeed')?.autoRoute).toBe(false);
+  });
+
   it('a provider pin ignores the candidate list and availability', () => {
     // Pinning openai still picks an openai model even though only qwen is a
     // candidate and no key is configured (it bypasses availability, like a

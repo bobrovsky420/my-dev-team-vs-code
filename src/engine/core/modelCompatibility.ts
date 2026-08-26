@@ -2,8 +2,8 @@
 import { LanguageModelMiddleware } from 'ai';
 
 /**
- * Gemini 3.7 chooses its own sampling configuration and rejects the generic
- * sampling knobs our agent frontmatter may supply. Keep the policy beside the
+ * Some frontier APIs choose their own sampling configuration and reject the
+ * generic knobs our agent frontmatter may supply. Keep the policy beside the
  * provider boundary so every agent and both generate/stream paths behave alike.
  */
 export function modelCompatibilityMiddleware(
@@ -13,7 +13,10 @@ export function modelCompatibilityMiddleware(
   return {
     specificationVersion: 'v3',
     transformParams: async ({ params }) => {
-      if (provider !== 'google' || !modelId.startsWith('gemini-3.7')) {
+      const fixedSampling =
+        (provider === 'google' && modelId.startsWith('gemini-3.7')) ||
+        (provider === 'kimi' && modelId.startsWith('kimi-'));
+      if (!fixedSampling) {
         return params;
       }
       const transformed = { ...params };

@@ -108,6 +108,8 @@ export const BackendConfigSchema = z
         deepseek: z.object({ baseUrl: endpointOverride, requestsPerMinute }).prefault({}),
         /** Z.AI base URL, like `myDevTeam.zai.baseUrl`. */
         zai: z.object({ baseUrl: endpointOverride, requestsPerMinute }).prefault({}),
+        /** Moonshot Kimi base URL, like `myDevTeam.kimi.baseUrl`. */
+        kimi: z.object({ baseUrl: endpointOverride, requestsPerMinute }).prefault({}),
         /** Google (Gemini) base URL, like `myDevTeam.google.baseUrl`. */
         google: z.object({ baseUrl: endpointOverride, requestsPerMinute }).prefault({}),
       })

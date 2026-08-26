@@ -16,7 +16,7 @@ concept), and keeps a personal or off-topic aside brief before steering back to
 the work rather than acting as a general chatbot. Out of the box everything
 runs locally against your own [Ollama](https://ollama.com) server and nothing
 leaves your machine; if you prefer, you can also point it at a cloud model
-(OpenAI, Anthropic, Groq, DeepSeek, or Z.AI) by adding an API key - see
+(OpenAI, Anthropic, Groq, DeepSeek, Z.AI, or Kimi) by adding an API key - see
 [Choosing a model](#4-choosing-a-model).
 
 It is meant to work alongside GitHub Copilot, not just replace it (though you
@@ -44,7 +44,7 @@ Copilot chat stops responding, `@devteam` keeps answering.
   If your Ollama server listens somewhere else, set the
   `myDevTeam.ollama.endpoint` setting (see [Settings](#7-settings)).
 
-  Cloud models (OpenAI, Anthropic, Groq, DeepSeek, Z.AI) are optional and need only an API key,
+  Cloud models (OpenAI, Anthropic, Groq, DeepSeek, Z.AI, Kimi) are optional and need only an API key,
   no Ollama pull - see [Choosing a model](#4-choosing-a-model).
 
 ## 2. Install
@@ -311,7 +311,7 @@ Out of the box the list is your local Ollama models. To use a cloud model, give
 it an API key one of two ways:
 
 1. **Run the "My Dev Team: Set API Key" command** (Ctrl+Shift+P) and paste your
-   OpenAI, Anthropic, Groq, DeepSeek, or Z.AI key. It is stored securely and never written to
+   OpenAI, Anthropic, Groq, DeepSeek, Z.AI, or Kimi key. It is stored securely and never written to
    your settings file. This works with the default (local) engine.
    **Or** set the `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GROQ_API_KEY`, `DEEPSEEK_API_KEY`, or `ZAI_API_KEY`
    environment variable before launching VS Code - the only option if you run
@@ -652,6 +652,7 @@ likely to touch:
 | `myDevTeam.groq.baseUrl`         | `""`                     | Custom Groq endpoint (a proxy/gateway); empty uses Groq's default |
 | `myDevTeam.deepseek.baseUrl`     | `""`                     | Custom DeepSeek endpoint (a proxy/gateway); empty uses DeepSeek's default |
 | `myDevTeam.zai.baseUrl`          | `""`                     | Custom Z.AI endpoint (the GLM models, a proxy/gateway); empty uses Z.AI's default (`https://api.z.ai/api/paas/v4`) |
+| `myDevTeam.kimi.baseUrl`         | `""`                     | Custom Moonshot Kimi endpoint (a proxy/gateway); empty uses Kimi's default (`https://api.moonshot.ai/v1`) |
 | `myDevTeam.provider.requestsPerMinute` | unset              | Your cap on requests per minute sent to each provider, to stay under its rate limit (e.g. a free-tier quota). Leave unset to use whatever rate your deployment ships with; set a number to override it, or `0` for no cap |
 | `myDevTeam.run.commandTimeoutMs` | `60000`                  | How long a shell command may run before it is killed |
 | `myDevTeam.run.allowedCommands`  | `[]`                     | Commands the agent may run without asking, as a command start or `*` pattern (e.g. `git status`, `npm test`, `npm run *`). The **Always allow** approval button adds to this. Only single, non-chained commands skip the prompt; a risky command (below) never does |

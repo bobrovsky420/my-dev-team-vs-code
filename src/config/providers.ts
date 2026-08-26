@@ -157,6 +157,23 @@ const rawDescriptors = [
     },
   },
   {
+    id: 'kimi',
+    label: 'Kimi',
+    keyless: false,
+    envKey: 'MOONSHOT_API_KEY',
+    secretKey: 'myDevTeam.kimi.apiKey',
+    baseUrlSetting: 'kimi.baseUrl',
+    build: ({ apiKey, baseUrl }: ProviderConfig) => {
+      // Moonshot's Kimi API is OpenAI-compatible but exposes Chat Completions,
+      // not the Responses transport used by the OpenAI provider.
+      const openai = createOpenAI({
+        apiKey,
+        baseURL: baseUrl ?? 'https://api.moonshot.ai/v1',
+      });
+      return (model: string) => openai.chat(model) as RoutedModel;
+    },
+  },
+  {
     id: 'google',
     label: 'Google',
     keyless: false,

@@ -20,6 +20,18 @@ describe('modelCompatibilityMiddleware', () => {
     expect(params.topK).toBeUndefined();
   });
 
+  it('removes fixed sampling parameters for Kimi frontier models', async () => {
+    const transform = modelCompatibilityMiddleware('kimi', 'kimi-k3').transformParams!;
+    const params = await transform({
+      type: 'generate',
+      params: { prompt: [], temperature: 0.1, topP: 0.8, topK: 40 },
+      model: {} as never,
+    });
+    expect(params.temperature).toBeUndefined();
+    expect(params.topP).toBeUndefined();
+    expect(params.topK).toBeUndefined();
+  });
+
   it('leaves other models unchanged', async () => {
     const transform = modelCompatibilityMiddleware('google', 'gemini-3.5-flash-lite')
       .transformParams!;

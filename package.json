@@ -176,6 +176,7 @@
                   "groq",
                   "deepseek",
                   "zai",
+                  "kimi",
                   "google"
                 ],
                 "description": "Which already-wired provider hosts the model. New custom models reuse an existing provider's wiring and API key; you cannot add a new provider here."
@@ -204,7 +205,7 @@
             }
           },
           "default": [],
-          "description": "Extra models to make available without updating the extension, e.g. a newly released Anthropic model. Each entry needs an id, a label, a provider (one already wired: anthropic, openai, google, ollama, llamacpp, groq, deepseek, zai), and the provider's model name. Cloud models still need that provider's API key. Pin one from the /model picker, or give capability scores to let Auto route to it. Add-only: an entry whose id matches a built-in model is ignored."
+          "description": "Extra models to make available without updating the extension, e.g. a newly released Anthropic model. Each entry needs an id, a label, a provider (one already wired: anthropic, openai, google, ollama, llamacpp, groq, deepseek, zai, kimi), and the provider's model name. Cloud models still need that provider's API key. Pin one from the /model picker, or give capability scores to let Auto route to it. Add-only: an entry whose id matches a built-in model is ignored."
         },
         "myDevTeam.ollama.endpoint": {
           "type": "string",
@@ -240,6 +241,11 @@
           "type": "string",
           "default": "",
           "description": "Optional custom base URL for the Z.AI provider (the GLM models, a proxy or gateway). Leave empty to use Z.AI's default endpoint (https://api.z.ai/api/paas/v4). The API key is read from the ZAI_API_KEY environment variable (or, for the local engine, the \"Set API Key\" command), not here."
+        },
+        "myDevTeam.kimi.baseUrl": {
+          "type": "string",
+          "default": "",
+          "description": "Optional custom base URL for the Moonshot Kimi provider (a proxy or gateway). Leave empty to use Kimi's default endpoint (https://api.moonshot.ai/v1). The API key is read from the MOONSHOT_API_KEY environment variable (or, for the local engine, the \"Set API Key\" command), not here."
         },
         "myDevTeam.google.baseUrl": {
           "type": "string",

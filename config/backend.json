@@ -11,6 +11,7 @@
     "groq": { "baseUrl": "", "requestsPerMinute": 0 },
     "deepseek": { "baseUrl": "", "requestsPerMinute": 0 },
     "zai": { "baseUrl": "", "requestsPerMinute": 0 },
+    "kimi": { "baseUrl": "", "requestsPerMinute": 0 },
     "google": { "baseUrl": "", "requestsPerMinute": 0 }
   },
   "agents": {
