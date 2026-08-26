@@ -597,7 +597,9 @@ describe('model registry and selection', () => {
     ]) {
       const selected = selectModel(requirements);
       const best = Math.max(
-        ...modelRegistry().map((info) => scoreModel(info, requirements))
+        ...modelRegistry()
+          .filter((info) => info.autoRoute)
+          .map((info) => scoreModel(info, requirements))
       );
       expect(scoreModel(selected, requirements)).toBe(best);
     }
@@ -618,7 +620,9 @@ describe('model registry and selection', () => {
     // registry's code specialist rather than a generalist.
     const executorModel = selectModel(agents.executor.capabilities);
     const bestCoding = Math.max(
-      ...modelRegistry().map((info) => info.capabilities['code-generation'] ?? 0)
+      ...modelRegistry()
+        .filter((info) => info.autoRoute)
+        .map((info) => info.capabilities['code-generation'] ?? 0)
     );
     expect(executorModel.capabilities['code-generation']).toBe(bestCoding);
   });

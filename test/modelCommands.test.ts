@@ -26,7 +26,7 @@ const choices: ModelChoice[] = [
   { id: 'auto', label: 'Auto', description: 'router', available: true },
   { id: 'provider:anthropic', label: 'Anthropic (best available)', description: 'cloud', available: false },
   { id: 'qwen3-coder', label: 'Qwen3 Coder (Ollama)', description: 'code', available: true },
-  { id: 'anthropic-opus', label: 'Claude Opus 4.8 (Anthropic)', description: 'best', available: false },
+  { id: 'anthropic-opus', label: 'Claude Opus 5 (Anthropic)', description: 'best', available: false },
 ];
 
 /** A stub engine that only answers listModels. */
@@ -56,7 +56,7 @@ function triageSetting(): unknown {
 describe('resolveModelArg', () => {
   it('matches by id or label, case-insensitively', () => {
     expect(resolveModelArg(choices, 'qwen3-coder')?.id).toBe('qwen3-coder');
-    expect(resolveModelArg(choices, 'Claude Opus 4.8 (Anthropic)')?.id).toBe('anthropic-opus');
+    expect(resolveModelArg(choices, 'Claude Opus 5 (Anthropic)')?.id).toBe('anthropic-opus');
     expect(resolveModelArg(choices, 'AUTO')?.id).toBe('auto');
     expect(resolveModelArg(choices, 'nope')).toBeUndefined();
   });
@@ -136,7 +136,7 @@ describe('pickModel', () => {
   it('pins a specific work model and returns the work scope', async () => {
     __setQuickPickResponse(5); // anthropic-opus (work)
     const picked = await pickModel(fakeEngine());
-    expect(picked).toEqual({ label: 'Claude Opus 4.8 (Anthropic)', scope: 'work' });
+    expect(picked).toEqual({ label: 'Claude Opus 5 (Anthropic)', scope: 'work' });
     expect(modelSetting()).toBe('anthropic-opus');
     expect(triageSetting()).toBeUndefined();
   });

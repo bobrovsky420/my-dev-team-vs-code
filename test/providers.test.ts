@@ -68,7 +68,7 @@ describe('provider registry', () => {
     // Z.AI: an OpenAI-compatible cloud provider, model id passes through (the
     // Z.AI default endpoint is applied inside build, not the model id).
     const zai = providerDescriptor('zai').build({ apiKey: 'k' });
-    expect(zai('glm-5.2').modelId).toBe('glm-5.2');
+    expect(zai('glm-5.3').modelId).toBe('glm-5.3');
   });
 
   it('builds Z.AI on the Chat Completions transport (its endpoint has no Responses API)', () => {
@@ -76,7 +76,7 @@ describe('provider registry', () => {
     // (provider id "openai.chat") rather than the SDK's default Responses
     // transport, since the Z.AI endpoint only implements /chat/completions.
     const zai = providerDescriptor('zai').build({ apiKey: 'k' });
-    expect(zai('glm-5.2').provider).toBe('openai.chat');
+    expect(zai('glm-5.3').provider).toBe('openai.chat');
   });
 
   it('builds llama.cpp on the Chat Completions transport, not the Responses API', () => {

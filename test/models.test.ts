@@ -213,7 +213,7 @@ describe('custom models (user-registered)', () => {
       { ...newOpus, id: 'anthropic-opus', model: 'hijacked' },
     ]);
     // The built-in keeps its model name; the colliding custom entry is dropped.
-    expect(modelById('anthropic-opus')?.model).toBe('claude-opus-4-8');
+    expect(modelById('anthropic-opus')?.model).toBe('claude-opus-5');
   });
 
   it('drops an invalid entry but keeps the valid ones', () => {
@@ -316,6 +316,22 @@ describe('triageOnly models', () => {
   it('an explicit pin overrides triageOnly (model id and provider pin)', () => {
     expect(routeModel(agents.executor.capabilities, 'llamacpp-local').id).toBe('llamacpp-local');
     expect(routeModel(agents.executor.capabilities, 'provider:llamacpp').id).toBe('llamacpp-local');
+  });
+});
+
+describe('manual-only models', () => {
+  it('keeps a manual-only model pinnable but out of Auto and provider routing', () => {
+    const fable = modelById('anthropic-fable')!;
+    expect(fable.autoRoute).toBe(false);
+    expect(workModels().some((m) => m.id === fable.id)).toBe(false);
+    expect(selectModel(agents.executor.capabilities, fable.id).id).toBe(fable.id);
+    expect(selectModel(agents.executor.capabilities, 'provider:anthropic').id).not.toBe(
+      fable.id
+    );
+  });
+
+  it('defaults autoRoute to true for ordinary models', () => {
+    expect(modelById('qwen3-8b')!.autoRoute).toBe(true);
   });
 });
 
@@ -430,7 +446,7 @@ describe('resolveModel', () => {
 
   it('wires the pinned model when one is given', () => {
     expect(resolveModel(agents.triage.capabilities, 'anthropic-opus').modelId).toBe(
-      'claude-opus-4-8'
+      'claude-opus-5'
     );
   });
 

@@ -148,6 +148,12 @@ const ModelFrontmatterSchema = z.object({
    * `selectModel`. Defaults to false (eligible for every agent).
    */
   triageOnly: z.boolean().default(false),
+  /**
+   * When false, the model stays in the catalogue for an explicit model-id pin
+   * but Auto and provider pins never select it. Useful for premium or preview
+   * models whose availability/cost should require an intentional choice.
+   */
+  autoRoute: z.boolean().default(true),
   /** How good this model is at each capability, 0–1. */
   capabilities: CapabilityScoresSchema,
   /**
@@ -363,11 +369,11 @@ export function scoreModel(info: ModelInfo, requirements: CapabilityScores): num
  * Pick the model for a requirement profile. A `pin` naming a registered model
  * overrides the router and returns that model outright - the user asked for
  * it, even if it is not in `candidates`. A `provider:<name>` pin narrows the
- * choice to that provider's models (all of them, like a model pin bypassing
- * availability) and routes by weight within it. "auto", an unknown id, or no
- * pin falls back to the highest weighted fit among `candidates` (the whole
- * registry by default; the caller passes a narrower set to keep Auto from
- * routing to a model that cannot run - see core/models.ts).
+ * choice to that provider's auto-routable models (bypassing key availability)
+ * and routes by weight within it. "auto", an unknown id, or no
+ * pin falls back to the highest weighted fit among the auto-routable members
+ * of `candidates` (the whole registry by default; the caller passes a narrower
+ * set to keep Auto from routing to a model that cannot run - see core/models.ts).
  *
  * A `complexity` narrows the pool to the request's tier before scoring (see
  * `tierPool`), so the same capability profile picks a cheaper model for simple
@@ -375,8 +381,10 @@ export function scoreModel(info: ModelInfo, requirements: CapabilityScores): num
  * user chose) and when the caller passes none; the provider-pin pool is still
  * tier-narrowed, so e.g. "provider:anthropic" + simple picks Haiku.
  *
- * `isEnabled` is the disable predicate the runtime injects (core/models.ts): a
- * disabled model is dropped from the provider-pin pool and from a candidate
+ * A model with `autoRoute: false` is skipped by Auto and provider pins while an
+ * explicit model-id pin still wins. `isEnabled` is the disable predicate the
+ * runtime injects (core/models.ts): a disabled model is dropped from the
+ * provider-pin pool and from a candidate
  * default, and a disabled pinned model falls through to scoring rather than
  * being returned outright - so disabling cannot be bypassed by any kind of pin.
  * It defaults to "everything enabled", keeping the pure function usable on its
@@ -395,8 +403,10 @@ export function selectModel(
   }
   const provider = providerPinOf(pin);
   const base = provider
-    ? modelRegistry().filter((m) => m.provider === provider && isEnabled(m))
-    : (candidates ?? modelRegistry()).filter(isEnabled);
+    ? modelRegistry().filter(
+        (m) => m.provider === provider && m.autoRoute && isEnabled(m)
+      )
+    : (candidates ?? modelRegistry()).filter((m) => m.autoRoute && isEnabled(m));
   const pool = complexity ? tierPool(base, complexity) : base;
   let best: ModelInfo | undefined;
   let bestScore = -Infinity;

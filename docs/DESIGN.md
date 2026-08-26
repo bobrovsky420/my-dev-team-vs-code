@@ -1271,7 +1271,7 @@ work agents carries triage along with no extra step.
 id: anthropic-opus
 label: Claude Opus 4.8 (Anthropic)
 provider: anthropic
-model: claude-opus-4-8
+model: claude-opus-5
 tier: complex            # the weight class complexity routing sizes to
 capabilities:
   reasoning: 0.98

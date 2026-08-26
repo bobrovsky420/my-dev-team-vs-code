@@ -20,6 +20,7 @@
 import { wrapLanguageModel } from 'ai';
 import { rateLimitMiddleware } from './rateLimiter';
 import { providerDebugMiddleware } from './providerLog';
+import { modelCompatibilityMiddleware } from './modelCompatibility';
 import {
   AUTO_MODEL,
   CapabilityScores,
@@ -252,19 +253,21 @@ export function availableModels(): ModelInfo[] {
 
 /**
  * The models Auto may route the *work* agents to (planner/answerer/executor/
- * summarizer): the available models minus any tagged `triageOnly` (eligible
- * only for the internal triage classifier). This is `routeModel`'s default
- * candidate pool, so a triage-only model is never handed real work by Auto - but
- * an explicit pin still reaches it, since `selectModel` returns a pin outright.
+ * summarizer): the available models minus manual-only (`autoRoute: false`) and
+ * `triageOnly` entries. This is `routeModel`'s default candidate pool, so those
+ * models are never handed real work by Auto - but an explicit model-id pin still
+ * reaches them, since `selectModel` returns a pin outright.
  */
 export function workModels(): ModelInfo[] {
-  return availableModels().filter((m) => !m.triageOnly);
+  return availableModels().filter((m) => m.autoRoute && !m.triageOnly);
 }
 
 /** The local Ollama models, minus anything disabled at either layer. The
  * default candidate pool for triage (the "ollama" provider choice). */
 export function localModels(): ModelInfo[] {
-  return modelRegistry().filter((m) => m.provider === 'ollama' && isModelEnabled(m));
+  return modelRegistry().filter(
+    (m) => m.provider === 'ollama' && m.autoRoute && isModelEnabled(m)
+  );
 }
 
 /** The provider names the registry knows, in a stable order. */
@@ -397,6 +400,7 @@ export function resolveModel(
     model = wrapLanguageModel({
       model: factory(info.model),
       middleware: [
+        modelCompatibilityMiddleware(info.provider, info.model),
         providerDebugMiddleware(info.provider, info.model),
         rateLimitMiddleware(info.provider),
       ],
