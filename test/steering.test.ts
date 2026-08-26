@@ -15,7 +15,7 @@ describe('steeringFor', () => {
   it('returns no steering for a frontier model that clears every threshold', () => {
     expect(steeringFor(model('anthropic-opus'))).toBe('');
     expect(steeringFor(model('anthropic-sonnet'))).toBe('');
-    expect(steeringFor(model('openai-gpt41'))).toBe('');
+    expect(steeringFor(model('openai-gpt56-sol'))).toBe('');
   });
 
   it('steers only output format for DeepSeek (strong reasoning/coding, weaker format)', () => {
